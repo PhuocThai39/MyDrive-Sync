@@ -159,7 +159,14 @@ public class AgentService implements AutoCloseable {
             notify("WARN", "Permission denied locally for " + action + ": " + path);
             return;
         }
-        Packet p = Packet.request(FILE_EVENT).with("workspaceId", ws).with("path", path).with("action", action);
+
+        long baseVersion = state.version(ws, path);
+        Packet p = Packet.request(FILE_EVENT)
+                .with("workspaceId", ws)
+                .with("path", path)
+                .with("action", action)
+                .with("baseVersion", baseVersion);
+
         Packet r;
         if ("DELETE".equals(action)) {
             r = network.request(p, Duration.ofSeconds(30));
@@ -168,12 +175,28 @@ public class AgentService implements AutoCloseable {
             if (!Files.isRegularFile(file)) return;
             r = network.request(p, file, Duration.ofMinutes(5));
         }
+
         if (ERROR.equals(r.type())) throw new IllegalStateException(r.get("message"));
-        if (FILE_EVENT_RESULT.equals(r.type())) {
-            if ("DELETE".equals(action)) state.remove(ws, path);
-            else state.put(ws, path, r.getLong("version", 0), r.get("checksum"));
-            notify("INFO", path + " synchronized (v" + r.get("version") + ")");
+        if (!FILE_EVENT_RESULT.equals(r.type())) return;
+
+        if (r.getBoolean("conflict", false)) {
+            notify("WARN", path + " conflicted: local base v" + baseVersion
+                    + ", server is v" + r.get("currentVersion"));
+            // Keep the local file/state untouched. A re-sync will preserve the dirty
+            // local copy and restore the current canonical version from another Agent.
+            syncNow();
+            return;
         }
+
+        long newVersion = r.getLong("version", 0);
+        if ("DELETE".equals(action)) {
+            // Keep the tombstone version so a later CREATE of the same path can send
+            // the correct baseVersion instead of pretending the path never existed.
+            state.put(ws, path, newVersion, "");
+        } else {
+            state.put(ws, path, newVersion, r.get("checksum"));
+        }
+        notify("INFO", path + " synchronized (v" + newVersion + ")");
     }
 
     public void syncNow() throws Exception {
@@ -233,38 +256,62 @@ public class AgentService implements AutoCloseable {
         Map<String, String> workspace = workspace(ws);
         if (workspace == null) { refreshWorkspaces(); workspace = workspace(ws); }
         if (workspace == null) return;
+
         String rel = p.get("path");
+        long incomingVersion = p.getLong("version", 0);
+        long knownVersion = state.version(ws, rel);
+        if (incomingVersion < knownVersion) {
+            notify("WARN", "Ignored stale remote version of " + rel + " (v" + incomingVersion + " < v" + knownVersion + ")");
+            return;
+        }
+
         Path target = safeResolve(workspaceDir(workspace), rel);
         Files.createDirectories(target.getParent());
-        ignore.ignore(target, 2500);
-        if (p.getBoolean("conflict", false) && Files.exists(target)) {
-            String name = target.getFileName().toString();
-            int dot = name.lastIndexOf('.');
-            String base = dot > 0 ? name.substring(0, dot) : name;
-            String ext = dot > 0 ? name.substring(dot) : "";
-            String stamp = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss"));
-            Path conflict = target.resolveSibling(base + "_conflict_" + config.deviceName().replaceAll("[^a-zA-Z0-9_-]", "_") + "_" + stamp + ext);
-            Files.copy(target, conflict, StandardCopyOption.REPLACE_EXISTING);
-            notify("WARN", "Conflict copy created: " + conflict.getFileName());
+
+        boolean dirty = Files.isRegularFile(target) && isLocalDirty(ws, rel, target);
+        boolean conflict = p.getBoolean("conflict", false) || dirty;
+        if (conflict && Files.isRegularFile(target)) {
+            Path conflictCopy = createConflictCopy(ws, rel, target);
+            notify("WARN", "Conflict copy created: " + conflictCopy);
         }
+
+        // Suppress any already-scheduled WatchService event caused by replacing the file.
+        ignore.ignore(target, 3000);
         Files.copy(tempPayload, target, StandardCopyOption.REPLACE_EXISTING);
+
         String checksum = HashUtil.sha256(target);
-        long version = p.getLong("version", 0);
-        state.put(ws, rel, version, checksum);
-        network.send(Packet.event(FILE_APPLIED).with("fileId", p.get("fileId")).with("version", version).with("checksum", checksum));
-        notify("INFO", "Downloaded/synced " + rel + " (v" + version + ")");
+        state.put(ws, rel, incomingVersion, checksum);
+        network.send(Packet.event(FILE_APPLIED)
+                .with("fileId", p.get("fileId"))
+                .with("version", incomingVersion)
+                .with("checksum", checksum));
+        notify("INFO", "Downloaded/synced " + rel + " (v" + incomingVersion + ")");
     }
 
     private void applyDelete(Packet p) throws Exception {
         long ws = p.getLong("workspaceId", 0);
         Map<String, String> workspace = workspace(ws);
         if (workspace == null) return;
+
         String rel = p.get("path");
+        long incomingVersion = p.getLong("version", 0);
+        long knownVersion = state.version(ws, rel);
+        if (incomingVersion < knownVersion) {
+            notify("WARN", "Ignored stale remote delete of " + rel + " (v" + incomingVersion + " < v" + knownVersion + ")");
+            return;
+        }
+
         Path target = safeResolve(workspaceDir(workspace), rel);
-        ignore.ignore(target, 2500);
+        if (Files.isRegularFile(target) && isLocalDirty(ws, rel, target)) {
+            Path conflictCopy = createConflictCopy(ws, rel, target);
+            notify("WARN", "Unsynced local changes preserved before remote delete: " + conflictCopy);
+        }
+
+        ignore.ignore(target, 3000);
         Files.deleteIfExists(target);
-        state.remove(ws, rel);
-        notify("INFO", rel + " deleted by synchronization");
+        // Keep a tombstone version instead of removing local state completely.
+        state.put(ws, rel, incomingVersion, "");
+        notify("INFO", rel + " deleted by synchronization (v" + incomingVersion + ")");
     }
 
     private void relayFile(Packet p) {
@@ -321,13 +368,28 @@ public class AgentService implements AutoCloseable {
         Map<String, String> ws = workspace(workspaceId);
         if (ws == null) throw new IllegalArgumentException("Workspace not found");
         if (!allowed(ws, "DELETE")) throw new SecurityException("No DELETE permission");
+
+        long baseVersion = state.version(workspaceId, relativePath);
         Path local = safeResolve(workspaceDir(ws), relativePath);
-        ignore.ignore(local, 2500);
+        ignore.ignore(local, 3000);
         Files.deleteIfExists(local);
-        Packet p = Packet.request(FILE_EVENT).with("workspaceId", workspaceId).with("path", relativePath).with("action", "DELETE");
+
+        Packet p = Packet.request(FILE_EVENT)
+                .with("workspaceId", workspaceId)
+                .with("path", relativePath)
+                .with("action", "DELETE")
+                .with("baseVersion", baseVersion);
         Packet r = network.request(p, Duration.ofSeconds(30));
         if (ERROR.equals(r.type())) throw new IllegalStateException(r.get("message"));
-        state.remove(workspaceId, relativePath);
+
+        if (r.getBoolean("conflict", false)) {
+            notify("WARN", relativePath + " delete conflicted: local base v" + baseVersion
+                    + ", server is v" + r.get("currentVersion"));
+            syncNow(); // the current server version will be restored locally
+            return;
+        }
+
+        state.put(workspaceId, relativePath, r.getLong("version", 0), "");
     }
 
     public void saveCopy(long workspaceId, String relativePath, Path destination) throws Exception {
@@ -366,6 +428,35 @@ public class AgentService implements AutoCloseable {
         state = new LocalStateStore(root);
         startWatchers();
         syncNow();
+    }
+
+    private boolean isLocalDirty(long workspaceId, String relativePath, Path localFile) throws Exception {
+        if (!Files.isRegularFile(localFile)) return false;
+        String knownChecksum = state.checksum(workspaceId, relativePath);
+        String currentChecksum = HashUtil.sha256(localFile);
+        return !Objects.equals(currentChecksum, knownChecksum);
+    }
+
+    private Path createConflictCopy(long workspaceId, String relativePath, Path source) throws Exception {
+        Path conflictRoot = config.syncRoot()
+                .resolve(".pbl4sync")
+                .resolve("conflicts")
+                .resolve(String.valueOf(workspaceId))
+                .toAbsolutePath().normalize();
+
+        Path logicalTarget = safeResolve(conflictRoot, relativePath);
+        Files.createDirectories(logicalTarget.getParent());
+
+        String name = logicalTarget.getFileName().toString();
+        int dot = name.lastIndexOf('.');
+        String base = dot > 0 ? name.substring(0, dot) : name;
+        String ext = dot > 0 ? name.substring(dot) : "";
+        String stamp = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss_SSS"));
+        String device = config.deviceName().replaceAll("[^a-zA-Z0-9_-]", "_");
+
+        Path conflict = logicalTarget.resolveSibling(base + "_conflict_" + device + "_" + stamp + ext);
+        Files.copy(source, conflict, StandardCopyOption.REPLACE_EXISTING);
+        return conflict;
     }
 
     public void setNotificationListener(BiConsumer<String, String> listener) { this.notificationListener = listener; }

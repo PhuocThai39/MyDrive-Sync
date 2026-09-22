@@ -358,34 +358,81 @@ public class Database implements AutoCloseable {
         return row == null ? "" : row.getOrDefault("workspace_role", "");
     }
 
-    public Map<String, String> applyFileChange(long workspaceId, String path, long size, String checksum, long userId, boolean deleted) throws SQLException {
+    public Map<String, String> applyFileChange(long workspaceId, String path, long size, String checksum,
+                                                    long userId, long baseVersion, boolean deleted) throws SQLException {
         Connection c = pool.borrow();
         try {
             c.setAutoCommit(false);
             Map<String, String> existing = queryOne(c,
-                    "SELECT id,version FROM files WHERE workspace_id=? AND relative_path=? FOR UPDATE", workspaceId, path);
+                    "SELECT id,size,checksum,version,deleted FROM files WHERE workspace_id=? AND relative_path=? FOR UPDATE",
+                    workspaceId, path);
+
             long id;
             long version;
+
             if (existing == null) {
+                // A truly new path must be based on version 0. If the Agent claims it
+                // edited/deleted a version that the server does not have, do not guess.
+                if (baseVersion != 0) {
+                    c.rollback();
+                    return row("conflict", true, "current_version", 0, "current_checksum", "", "current_deleted", true);
+                }
+
                 try (PreparedStatement ps = c.prepareStatement(
                         "INSERT INTO files(workspace_id,relative_path,size,checksum,version,modified_by,modified_at,deleted) VALUES(?,?,?,?,1,?,NOW(),?)",
                         Statement.RETURN_GENERATED_KEYS)) {
-                    ps.setLong(1, workspaceId); ps.setString(2, path); ps.setLong(3, size); ps.setString(4, checksum);
-                    ps.setLong(5, userId); ps.setBoolean(6, deleted); ps.executeUpdate();
+                    ps.setLong(1, workspaceId);
+                    ps.setString(2, path);
+                    ps.setLong(3, size);
+                    ps.setString(4, checksum);
+                    ps.setLong(5, userId);
+                    ps.setBoolean(6, deleted);
+                    ps.executeUpdate();
                     try (ResultSet rs = ps.getGeneratedKeys()) { rs.next(); id = rs.getLong(1); }
                 }
                 version = 1;
             } else {
                 id = Long.parseLong(existing.get("id"));
-                version = Long.parseLong(existing.get("version")) + 1;
+                long currentVersion = Long.parseLong(existing.get("version"));
+
+                // Optimistic concurrency check: the Agent is only allowed to change
+                // exactly the version on which its local edit/delete was based.
+                if (baseVersion != currentVersion) {
+                    c.rollback();
+                    return row(
+                            "conflict", true,
+                            "id", id,
+                            "current_version", currentVersion,
+                            "current_checksum", existing.getOrDefault("checksum", ""),
+                            "current_deleted", existing.getOrDefault("deleted", "false"),
+                            "current_size", existing.getOrDefault("size", "0")
+                    );
+                }
+
+                version = currentVersion + 1;
                 try (PreparedStatement ps = c.prepareStatement(
                         "UPDATE files SET size=?,checksum=?,version=?,modified_by=?,modified_at=NOW(),deleted=? WHERE id=?")) {
-                    ps.setLong(1, size); ps.setString(2, checksum); ps.setLong(3, version); ps.setLong(4, userId); ps.setBoolean(5, deleted); ps.setLong(6, id); ps.executeUpdate();
+                    ps.setLong(1, size);
+                    ps.setString(2, checksum);
+                    ps.setLong(3, version);
+                    ps.setLong(4, userId);
+                    ps.setBoolean(5, deleted);
+                    ps.setLong(6, id);
+                    ps.executeUpdate();
                 }
             }
+
             c.commit();
-            return row("id", id, "workspace_id", workspaceId, "relative_path", path, "size", size,
-                    "checksum", checksum, "version", version, "deleted", deleted);
+            return row(
+                    "conflict", false,
+                    "id", id,
+                    "workspace_id", workspaceId,
+                    "relative_path", path,
+                    "size", size,
+                    "checksum", checksum,
+                    "version", version,
+                    "deleted", deleted
+            );
         } catch (SQLException e) {
             try { c.rollback(); } catch (SQLException ignored) { }
             throw e;

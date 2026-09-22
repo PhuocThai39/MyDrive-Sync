@@ -242,6 +242,7 @@ public class ServerCore implements AutoCloseable {
         if (!db.hasPermission(s.userId(), s.isAdmin(), ws, permission)) throw new SecurityException("Permission denied: " + permission);
 
         boolean deleted = "DELETE".equals(action);
+        long baseVersion = p.getLong("baseVersion", 0);
         Path cached = null;
         long size = 0;
         String checksum = "";
@@ -253,7 +254,21 @@ public class ServerCore implements AutoCloseable {
             Files.copy(received.payloadPath(), cached, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
         }
 
-        Map<String, String> file = db.applyFileChange(ws, path, size, checksum, s.userId(), deleted);
+        Map<String, String> file = db.applyFileChange(ws, path, size, checksum, s.userId(), baseVersion, deleted);
+        if (truthy(file.get("conflict"))) {
+            if (cached != null) Files.deleteIfExists(cached);
+            s.send(p.response(FILE_EVENT_RESULT)
+                    .with("success", false)
+                    .with("conflict", true)
+                    .with("path", path)
+                    .with("workspaceId", ws)
+                    .with("baseVersion", baseVersion)
+                    .with("currentVersion", file.getOrDefault("current_version", "0"))
+                    .with("currentChecksum", file.getOrDefault("current_checksum", ""))
+                    .with("currentDeleted", file.getOrDefault("current_deleted", "false")));
+            return;
+        }
+
         long fileId = Long.parseLong(file.get("id"));
         long version = Long.parseLong(file.get("version"));
         if (!deleted) db.markReplica(fileId, s.agentId(), version, checksum);
@@ -352,9 +367,26 @@ public class ServerCore implements AutoCloseable {
             if (Objects.equals(localChecksum, f.getOrDefault("checksum", ""))) {
                 db.markReplica(parseLong(f.get("id"), 0), s.agentId(), serverVersion, localChecksum);
                 s.send(Packet.event(SYNC_STATE).with("workspaceId", ws).with("path", path).with("version", serverVersion).with("checksum", localChecksum));
-            } else if (knownVersion == serverVersion || knownVersion > serverVersion) {
-                s.send(Packet.event(FILE_UPLOAD_REQUEST).with("workspaceId", ws).with("path", path).with("action", "MODIFY"));
-                actions++;
+            } else if (knownVersion == serverVersion) {
+                if (db.hasPermission(s.userId(), s.isAdmin(), ws, "MODIFY")) {
+                    s.send(Packet.event(FILE_UPLOAD_REQUEST)
+                            .with("workspaceId", ws)
+                            .with("path", path)
+                            .with("action", "MODIFY"));
+                    actions++;
+                } else {
+                    s.send(Packet.event(CONFLICT_NOTICE)
+                            .with("workspaceId", ws)
+                            .with("path", path)
+                            .with("message", "Local file changed but this user has no MODIFY permission"));
+                    if (requestCurrentReplica(s, f, true)) actions++;
+                }
+            } else if (knownVersion > serverVersion) {
+                s.send(Packet.event(CONFLICT_NOTICE)
+                        .with("workspaceId", ws)
+                        .with("path", path)
+                        .with("message", "Local state is newer than server metadata; refusing automatic overwrite"));
+                if (requestCurrentReplica(s, f, true)) actions++;
             } else {
                 s.send(Packet.event(CONFLICT_NOTICE).with("workspaceId", ws).with("path", path).with("message", "Local and server versions both changed"));
                 if (requestCurrentReplica(s, f, true)) actions++;
