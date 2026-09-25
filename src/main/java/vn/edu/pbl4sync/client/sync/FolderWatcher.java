@@ -53,7 +53,9 @@ public class FolderWatcher implements AutoCloseable {
             for (WatchEvent<?> e : key.pollEvents()) {
                 if (e.kind() == OVERFLOW) continue;
                 Path child = dir.resolve((Path)e.context()).toAbsolutePath().normalize();
-                if (ignore.shouldIgnore(child) || child.getFileName().toString().startsWith(".pbl4sync")) continue;
+                if (ignore.shouldIgnore(child) || SyncFileFilter.shouldIgnore(child)) {
+                 continue;
+                }
                 try {
                     if (e.kind() == ENTRY_CREATE && Files.isDirectory(child)) {
                         registerAll(child);
@@ -70,24 +72,65 @@ public class FolderWatcher implements AutoCloseable {
     }
 
     private void schedule(Path absolute, String relative, String action) {
-        Pending old = pending.get(absolute);
-        String effective = action;
-        if (old != null) {
-            old.future().cancel(false);
-            if ("CREATE".equals(old.action()) && "MODIFY".equals(action)) effective = "CREATE";
-        }
-        if ("DELETE".equals(action)) {
-            pending.remove(absolute);
-            callback.accept("DELETE", relative);
-            return;
-        }
-        String finalAction = effective;
+    Pending old = pending.get(absolute);
+
+    // Hủy event đang chờ của cùng file
+    if (old != null) {
+        old.future().cancel(false);
+    }
+
+    // DELETE: chưa gửi ngay, chờ xem có CREATE lại không
+    if ("DELETE".equals(action)) {
         ScheduledFuture<?> future = debounce.schedule(() -> {
             pending.remove(absolute);
-            if (!ignore.shouldIgnore(absolute) && Files.exists(absolute) && Files.isRegularFile(absolute)) callback.accept(finalAction, relative);
-        }, 550, TimeUnit.MILLISECONDS);
-        pending.put(absolute, new Pending(effective, future));
+
+            // Sau thời gian chờ mà file vẫn không tồn tại
+            // => đây mới là DELETE thật
+            if (!ignore.shouldIgnore(absolute)
+                    && !SyncFileFilter.shouldIgnore(absolute)
+                    && !Files.exists(absolute)) {
+
+                callback.accept("DELETE", relative);
+            }
+        }, 900, TimeUnit.MILLISECONDS);
+
+        pending.put(absolute, new Pending("DELETE", future));
+        return;
     }
+
+    String effective = action;
+
+    // DELETE -> CREATE nhanh
+    // => Word/Office đang thay thế file cũ
+    // => coi toàn bộ là MODIFY
+    if (old != null && "DELETE".equals(old.action())
+            && "CREATE".equals(action)) {
+        effective = "MODIFY";
+    }
+
+    // CREATE -> MODIFY
+    // => file vừa tạo xong rồi tiếp tục được ghi
+    if (old != null && "CREATE".equals(old.action())
+            && "MODIFY".equals(action)) {
+        effective = "CREATE";
+    }
+
+    String finalAction = effective;
+
+    ScheduledFuture<?> future = debounce.schedule(() -> {
+        pending.remove(absolute);
+
+        if (!ignore.shouldIgnore(absolute)
+                && !SyncFileFilter.shouldIgnore(absolute)
+                && Files.exists(absolute)
+                && Files.isRegularFile(absolute)) {
+
+            callback.accept(finalAction, relative);
+        }
+    }, 550, TimeUnit.MILLISECONDS);
+
+    pending.put(absolute, new Pending(effective, future));
+}
 
     @Override public void close() {
         running = false;
