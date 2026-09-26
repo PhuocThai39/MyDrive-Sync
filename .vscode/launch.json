@@ -3,6 +3,13 @@
   "configurations": [
     {
       "type": "java",
+      "name": "LoadTestMain",
+      "request": "launch",
+      "mainClass": "vn.edu.pbl4sync.tools.LoadTestMain",
+      "projectName": "pbl4-company-sync"
+    },
+    {
+      "type": "java",
       "name": "Run PBL4 Server",
       "request": "launch",
       "mainClass": "vn.edu.pbl4sync.server.ServerMain",

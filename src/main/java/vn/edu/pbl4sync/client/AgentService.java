@@ -207,7 +207,7 @@ public class AgentService implements AutoCloseable {
             if (!Files.exists(dir)) continue;
             try (var stream = Files.walk(dir)) {
                 for (Path p : stream.filter(Files::isRegularFile).toList()) {
-                    if (p.getFileName().toString().startsWith(".pbl4sync")) continue;
+                    if (SyncFileFilter.shouldIgnore(p)) continue;
                     String rel = dir.relativize(p).toString().replace('\\', '/');
                     Map<String, String> row = new LinkedHashMap<>();
                     row.put("workspace_id", String.valueOf(wsId));
