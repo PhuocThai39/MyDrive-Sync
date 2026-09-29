@@ -18,11 +18,16 @@ public class AgentService implements AutoCloseable {
     private final ClientConfig config;
     private final NetworkClient network = new NetworkClient();
     private final ExecutorService workers = Executors.newFixedThreadPool(6);
+    private final ScheduledExecutorService syncScheduler = Executors.newSingleThreadScheduledExecutor();
     private final IgnoreRegistry ignore = new IgnoreRegistry();
     private final Map<Long, FolderWatcher> watchers = new ConcurrentHashMap<>();
+    private final Set<String> pendingDeferredSync = ConcurrentHashMap.newKeySet();
+    private final Set<String> pendingLocalUploadRetry = ConcurrentHashMap.newKeySet();
+    private final Set<String> suppressedWarnings = ConcurrentHashMap.newKeySet();
     private volatile List<Map<String, String>> workspaces = new ArrayList<>();
     private volatile LocalStateStore state;
-    private volatile BiConsumer<String, String> notificationListener = (l,m) -> {};
+    private volatile BiConsumer<String, String> notificationListener = (l, m) -> {
+    };
     private long userId;
     private long agentId;
     private String username = "";
@@ -35,7 +40,9 @@ public class AgentService implements AutoCloseable {
     }
 
     public void connectAndLogin(String host, int port, String username, String password) throws Exception {
-        config.setHost(host); config.setPort(port); config.save();
+        config.setHost(host);
+        config.setPort(port);
+        config.save();
         network.connect(host, port);
         Packet login = Packet.request(LOGIN_REQUEST)
                 .with("username", username)
@@ -54,7 +61,13 @@ public class AgentService implements AutoCloseable {
         this.state = new LocalStateStore(config.syncRoot());
         refreshWorkspaces();
         startWatchers();
-        workers.submit(() -> { try { syncNow(); } catch (Exception e) { notify("WARN", "Initial sync: " + e.getMessage()); } });
+        workers.submit(() -> {
+            try {
+                syncNow();
+            } catch (Exception e) {
+                notify("WARN", "Initial sync: " + e.getMessage());
+            }
+        });
     }
 
     public synchronized List<Map<String, String>> refreshWorkspaces() throws Exception {
@@ -63,68 +76,110 @@ public class AgentService implements AutoCloseable {
         return workspaces;
     }
 
-    public List<Map<String, String>> workspaces() { return List.copyOf(workspaces); }
-    public boolean isAdmin() { return "ADMIN".equalsIgnoreCase(systemRole); }
-    public String username() { return username; }
-    public long userId() { return userId; }
-    public long agentId() { return agentId; }
-    public ClientConfig config() { return config; }
-    public boolean connected() { return network.isConnected(); }
+    public List<Map<String, String>> workspaces() {
+        return List.copyOf(workspaces);
+    }
+
+    public boolean isAdmin() {
+        return "ADMIN".equalsIgnoreCase(systemRole);
+    }
+
+    public String username() {
+        return username;
+    }
+
+    public long userId() {
+        return userId;
+    }
+
+    public long agentId() {
+        return agentId;
+    }
+
+    public ClientConfig config() {
+        return config;
+    }
+
+    public boolean connected() {
+        return network.isConnected();
+    }
 
     public Map<String, String> dashboard() throws Exception {
         return request(Packet.request(DASHBOARD_REQUEST)).data();
     }
+
     public List<Map<String, String>> listFiles(long workspaceId) throws Exception {
-        return TableCodec.decode(request(Packet.request(LIST_FILES_REQUEST).with("workspaceId", workspaceId)).get("rows"));
+        return TableCodec
+                .decode(request(Packet.request(LIST_FILES_REQUEST).with("workspaceId", workspaceId)).get("rows"));
     }
+
     public List<Map<String, String>> listMembers(long workspaceId) throws Exception {
-        return TableCodec.decode(request(Packet.request(LIST_MEMBERS_REQUEST).with("workspaceId", workspaceId)).get("rows"));
+        return TableCodec
+                .decode(request(Packet.request(LIST_MEMBERS_REQUEST).with("workspaceId", workspaceId)).get("rows"));
     }
+
     public List<Map<String, String>> listUsers() throws Exception {
         return TableCodec.decode(request(Packet.request(LIST_USERS_REQUEST)).get("rows"));
     }
+
     public List<Map<String, String>> listAgents() throws Exception {
         return TableCodec.decode(request(Packet.request(LIST_AGENTS_REQUEST)).get("rows"));
     }
+
     public List<Map<String, String>> listActivity(Long workspaceId) throws Exception {
         Packet p = Packet.request(LIST_ACTIVITY_REQUEST).with("limit", 200);
-        if (workspaceId != null) p.with("workspaceId", workspaceId);
+        if (workspaceId != null)
+            p.with("workspaceId", workspaceId);
         return TableCodec.decode(request(p).get("rows"));
     }
 
     public void createUser(String username, String password, String role) throws Exception {
-        request(Packet.request(CREATE_USER_REQUEST).with("username", username).with("password", password).with("role", role));
+        request(Packet.request(CREATE_USER_REQUEST).with("username", username).with("password", password).with("role",
+                role));
     }
+
     public void setUserStatus(long userId, String status) throws Exception {
         request(Packet.request(SET_USER_STATUS_REQUEST).with("userId", userId).with("status", status));
     }
+
     public void createWorkspace(String name, String leaderUsername) throws Exception {
         request(Packet.request(CREATE_WORKSPACE_REQUEST).with("name", name).with("leaderUsername", leaderUsername));
-        refreshWorkspaces(); restartWatchers();
+        refreshWorkspaces();
+        restartWatchers();
     }
-    public void addMember(long ws, String username, boolean read, boolean write, boolean modify, boolean delete) throws Exception {
+
+    public void addMember(long ws, String username, boolean read, boolean write, boolean modify, boolean delete)
+            throws Exception {
         request(Packet.request(ADD_MEMBER_REQUEST).with("workspaceId", ws).with("username", username)
                 .with("read", read).with("write", write).with("modify", modify).with("delete", delete));
     }
-    public void updatePermission(long ws, long memberUserId, boolean read, boolean write, boolean modify, boolean delete) throws Exception {
+
+    public void updatePermission(long ws, long memberUserId, boolean read, boolean write, boolean modify,
+            boolean delete) throws Exception {
         request(Packet.request(UPDATE_PERMISSION_REQUEST).with("workspaceId", ws).with("userId", memberUserId)
                 .with("read", read).with("write", write).with("modify", modify).with("delete", delete));
     }
+
     public void removeMember(long ws, long memberUserId) throws Exception {
         request(Packet.request(REMOVE_MEMBER_REQUEST).with("workspaceId", ws).with("userId", memberUserId));
     }
+
     public void changeLeader(long ws, String leaderUsername) throws Exception {
         request(Packet.request(CHANGE_LEADER_REQUEST).with("workspaceId", ws).with("leaderUsername", leaderUsername));
-        refreshWorkspaces(); restartWatchers();
+        refreshWorkspaces();
+        restartWatchers();
     }
+
     public void deleteWorkspace(long ws) throws Exception {
         request(Packet.request(DELETE_WORKSPACE_REQUEST).with("workspaceId", ws));
-        refreshWorkspaces(); restartWatchers();
+        refreshWorkspaces();
+        restartWatchers();
     }
 
     private Packet request(Packet p) throws Exception {
         Packet r = network.request(p, Duration.ofSeconds(15));
-        if (ERROR.equals(r.type())) throw new IllegalStateException(r.get("message"));
+        if (ERROR.equals(r.type()))
+            throw new IllegalStateException(r.get("message"));
         return r;
     }
 
@@ -140,21 +195,26 @@ public class AgentService implements AutoCloseable {
     }
 
     private synchronized void restartWatchers() throws Exception {
-        for (FolderWatcher w : watchers.values()) w.close();
+        for (FolderWatcher w : watchers.values())
+            w.close();
         watchers.clear();
         startWatchers();
     }
 
     private void localFileEvent(long ws, String path, String action) {
         workers.submit(() -> {
-            try { uploadLocalChange(ws, path, action); }
-            catch (Exception e) { notify("ERROR", action + " " + path + " failed: " + e.getMessage()); }
+            try {
+                uploadLocalChange(ws, path, action);
+            } catch (Exception e) {
+                notify("ERROR", action + " " + path + " failed: " + e.getMessage());
+            }
         });
     }
 
     private void uploadLocalChange(long ws, String path, String action) throws Exception {
         Map<String, String> workspace = workspace(ws);
-        if (workspace == null) return;
+        if (workspace == null)
+            return;
         if (!allowed(workspace, action)) {
             notify("WARN", "Permission denied locally for " + action + ": " + path);
             return;
@@ -172,16 +232,19 @@ public class AgentService implements AutoCloseable {
             r = network.request(p, Duration.ofSeconds(30));
         } else {
             Path file = safeResolve(workspaceDir(workspace), path);
-            if (!Files.isRegularFile(file)) return;
+            if (!Files.isRegularFile(file))
+                return;
             r = network.request(p, file, Duration.ofMinutes(5));
         }
 
-        if (ERROR.equals(r.type())) throw new IllegalStateException(r.get("message"));
-        if (!FILE_EVENT_RESULT.equals(r.type())) return;
+        if (ERROR.equals(r.type()))
+            throw new IllegalStateException(r.get("message"));
+        if (!FILE_EVENT_RESULT.equals(r.type()))
+            return;
 
         if (r.getBoolean("conflict", false)) {
-            notify("WARN", path + " conflicted: local base v" + baseVersion
-                    + ", server is v" + r.get("currentVersion"));
+            warnOnce("conflict-upload:" + ws + ":" + path,
+                    path + " conflicted: local base v" + baseVersion + ", server is v" + r.get("currentVersion"));
             // Keep the local file/state untouched. A re-sync will preserve the dirty
             // local copy and restore the current canonical version from another Agent.
             syncNow();
@@ -204,10 +267,12 @@ public class AgentService implements AutoCloseable {
         for (Map<String, String> ws : workspaces) {
             long wsId = parseLong(ws.get("id"), 0);
             Path dir = workspaceDir(ws);
-            if (!Files.exists(dir)) continue;
+            if (!Files.exists(dir))
+                continue;
             try (var stream = Files.walk(dir)) {
                 for (Path p : stream.filter(Files::isRegularFile).toList()) {
-                    if (SyncFileFilter.shouldIgnore(p)) continue;
+                    if (SyncFileFilter.shouldIgnore(p))
+                        continue;
                     String rel = dir.relativize(p).toString().replace('\\', '/');
                     Map<String, String> row = new LinkedHashMap<>();
                     row.put("workspace_id", String.valueOf(wsId));
@@ -221,7 +286,8 @@ public class AgentService implements AutoCloseable {
         }
         Packet p = Packet.request(SYNC_REPORT).with("rows", TableCodec.encode(rows));
         Packet r = network.request(p, Duration.ofMinutes(2));
-        if (ERROR.equals(r.type())) throw new IllegalStateException(r.get("message"));
+        if (ERROR.equals(r.type()))
+            throw new IllegalStateException(r.get("message"));
         notify("INFO", "Sync scan completed; server scheduled " + r.get("actions") + " action(s)");
     }
 
@@ -233,17 +299,28 @@ public class AgentService implements AutoCloseable {
                 case FILE_DELETE -> applyDelete(p);
                 case FILE_FETCH_REQUEST -> workers.submit(() -> relayFile(p));
                 case FILE_UPLOAD_REQUEST -> workers.submit(() -> {
-                    try { uploadLocalChange(p.getLong("workspaceId", 0), p.get("path"), p.get("action")); }
-                    catch (Exception e) { notify("ERROR", "Requested upload failed: " + e.getMessage()); }
+                    try {
+                        uploadLocalChange(p.getLong("workspaceId", 0), p.get("path"), p.get("action"));
+                    } catch (Exception e) {
+                        notify("ERROR", "Requested upload failed: " + e.getMessage());
+                    }
                 });
-                case SYNC_STATE -> state.put(p.getLong("workspaceId", 0), p.get("path"), p.getLong("version", 0), p.get("checksum"));
+                case SYNC_STATE ->
+                    state.put(p.getLong("workspaceId", 0), p.get("path"), p.getLong("version", 0), p.get("checksum"));
                 case CONFLICT_NOTICE -> notify("WARN", "Conflict: " + p.get("path") + " - " + p.get("message"));
                 case NOTIFICATION -> notify(p.get("level").isBlank() ? "INFO" : p.get("level"), p.get("message"));
                 case WORKSPACES_CHANGED -> workers.submit(() -> {
-                    try { refreshWorkspaces(); restartWatchers(); syncNow(); notify("INFO", "Workspace list updated"); }
-                    catch (Exception e) { notify("WARN", "Cannot refresh workspaces: " + e.getMessage()); }
+                    try {
+                        refreshWorkspaces();
+                        restartWatchers();
+                        syncNow();
+                        notify("INFO", "Workspace list updated");
+                    } catch (Exception e) {
+                        notify("WARN", "Cannot refresh workspaces: " + e.getMessage());
+                    }
                 });
-                default -> { }
+                default -> {
+                }
             }
         } catch (Exception e) {
             notify("ERROR", "Incoming sync error: " + e.getMessage());
@@ -251,33 +328,79 @@ public class AgentService implements AutoCloseable {
     }
 
     private void applyDeliveredFile(Packet p, Path tempPayload) throws Exception {
-        if (tempPayload == null) return;
+        if (tempPayload == null)
+            return;
         long ws = p.getLong("workspaceId", 0);
         Map<String, String> workspace = workspace(ws);
-        if (workspace == null) { refreshWorkspaces(); workspace = workspace(ws); }
-        if (workspace == null) return;
+        if (workspace == null) {
+            refreshWorkspaces();
+            workspace = workspace(ws);
+        }
+        if (workspace == null)
+            return;
 
         String rel = p.get("path");
         long incomingVersion = p.getLong("version", 0);
         long knownVersion = state.version(ws, rel);
-        if (incomingVersion < knownVersion) {
-            notify("WARN", "Ignored stale remote version of " + rel + " (v" + incomingVersion + " < v" + knownVersion + ")");
+        String remoteChecksum = p.get("checksum");
+        Path target = safeResolve(workspaceDir(workspace), rel);
+        String localChecksum = Files.isRegularFile(target) ? HashUtil.sha256(target) : "";
+        boolean staleRemoteVersion = incomingVersion < knownVersion;
+        boolean sameVersionDifferentContent = incomingVersion == knownVersion
+                && !Objects.equals(remoteChecksum, localChecksum) && !localChecksum.isBlank();
+        if (staleRemoteVersion || sameVersionDifferentContent) {
+            Files.createDirectories(target.getParent());
+            String key = "conflict-remote:" + ws + ":" + rel;
+            if (Files.isRegularFile(target)) {
+                createConflictCopy(ws, rel, target);
+                warnOnce(key, "Conflict detected for " + rel
+                        + ": local version is newer or different from server. A conflict copy was saved.");
+            } else {
+                warnOnce(key, "Conflict detected for " + rel
+                        + ": local version is newer or different from server. Server version will not overwrite the local copy.");
+            }
             return;
         }
 
-        Path target = safeResolve(workspaceDir(workspace), rel);
         Files.createDirectories(target.getParent());
 
         boolean dirty = Files.isRegularFile(target) && isLocalDirty(ws, rel, target);
         boolean conflict = p.getBoolean("conflict", false) || dirty;
         if (conflict && Files.isRegularFile(target)) {
-            Path conflictCopy = createConflictCopy(ws, rel, target);
-            notify("WARN", "Conflict copy created: " + conflictCopy);
+            createConflictCopy(ws, rel, target);
+            warnOnce("conflict-local:" + ws + ":" + rel,
+                    "Conflict copy created for " + rel
+                            + ". Local changes were preserved and the server version is waiting for resolution.");
         }
 
-        // Suppress any already-scheduled WatchService event caused by replacing the file.
-        ignore.ignore(target, 3000);
-        Files.copy(tempPayload, target, StandardCopyOption.REPLACE_EXISTING);
+        try {
+            // Suppress any already-scheduled WatchService event caused by replacing the
+            // file.
+            ignore.ignore(target, 3000);
+            Files.copy(tempPayload, target, StandardCopyOption.REPLACE_EXISTING);
+            suppressedWarnings.remove(ws + ":" + rel);
+            pendingDeferredSync.remove(ws + ":" + rel);
+            pendingLocalUploadRetry.remove(ws + ":" + rel);
+        } catch (Exception ex) {
+            String key = ws + ":" + rel;
+            if (Files.isRegularFile(target)) {
+                if (!dirty) {
+                    warnOnce(key, "New server version received for " + rel
+                            + ", but the file is currently locked; sync will retry after it is closed.");
+                    scheduleDeferredSync(key, rel);
+                    return;
+                }
+                createConflictCopy(ws, rel, target);
+                warnOnce(key, "Conflict detected for " + rel
+                        + ". Local changes were preserved. The server version remains authoritative until resolved.");
+                scheduleLocalUploadRetry(key, ws, rel);
+                return;
+            }
+            warnOnce(key, "New server version received for " + rel
+                    + ", but the local file is not available right now. Sync will retry when the file is available again.");
+            scheduleDeferredSync(key, rel);
+            return;
+        }
 
         String checksum = HashUtil.sha256(target);
         state.put(ws, rel, incomingVersion, checksum);
@@ -291,13 +414,15 @@ public class AgentService implements AutoCloseable {
     private void applyDelete(Packet p) throws Exception {
         long ws = p.getLong("workspaceId", 0);
         Map<String, String> workspace = workspace(ws);
-        if (workspace == null) return;
+        if (workspace == null)
+            return;
 
         String rel = p.get("path");
         long incomingVersion = p.getLong("version", 0);
         long knownVersion = state.version(ws, rel);
         if (incomingVersion < knownVersion) {
-            notify("WARN", "Ignored stale remote delete of " + rel + " (v" + incomingVersion + " < v" + knownVersion + ")");
+            notify("WARN",
+                    "Ignored stale remote delete of " + rel + " (v" + incomingVersion + " < v" + knownVersion + ")");
             return;
         }
 
@@ -318,7 +443,8 @@ public class AgentService implements AutoCloseable {
         try {
             long ws = p.getLong("workspaceId", 0);
             Map<String, String> workspace = workspace(ws);
-            if (workspace == null) return;
+            if (workspace == null)
+                return;
             Path file = safeResolve(workspaceDir(workspace), p.get("path"));
             if (!Files.isRegularFile(file)) {
                 notify("WARN", "Server requested a replica that is missing locally: " + p.get("path"));
@@ -351,7 +477,8 @@ public class AgentService implements AutoCloseable {
 
     public void uploadFile(long workspaceId, Path source) throws Exception {
         Map<String, String> ws = workspace(workspaceId);
-        if (ws == null) throw new IllegalArgumentException("Workspace not found");
+        if (ws == null)
+            throw new IllegalArgumentException("Workspace not found");
         Path dir = workspaceDir(ws);
         Files.createDirectories(dir);
         Path target = dir.resolve(source.getFileName().toString());
@@ -360,14 +487,17 @@ public class AgentService implements AutoCloseable {
 
     public void deleteLocalFile(long workspaceId, String relativePath) throws Exception {
         Map<String, String> ws = workspace(workspaceId);
-        if (ws == null) return;
+        if (ws == null)
+            return;
         Files.deleteIfExists(safeResolve(workspaceDir(ws), relativePath));
     }
 
     public void deleteWorkspaceFile(long workspaceId, String relativePath) throws Exception {
         Map<String, String> ws = workspace(workspaceId);
-        if (ws == null) throw new IllegalArgumentException("Workspace not found");
-        if (!allowed(ws, "DELETE")) throw new SecurityException("No DELETE permission");
+        if (ws == null)
+            throw new IllegalArgumentException("Workspace not found");
+        if (!allowed(ws, "DELETE"))
+            throw new SecurityException("No DELETE permission");
 
         long baseVersion = state.version(workspaceId, relativePath);
         Path local = safeResolve(workspaceDir(ws), relativePath);
@@ -380,7 +510,8 @@ public class AgentService implements AutoCloseable {
                 .with("action", "DELETE")
                 .with("baseVersion", baseVersion);
         Packet r = network.request(p, Duration.ofSeconds(30));
-        if (ERROR.equals(r.type())) throw new IllegalStateException(r.get("message"));
+        if (ERROR.equals(r.type()))
+            throw new IllegalStateException(r.get("message"));
 
         if (r.getBoolean("conflict", false)) {
             notify("WARN", relativePath + " delete conflicted: local base v" + baseVersion
@@ -394,15 +525,20 @@ public class AgentService implements AutoCloseable {
 
     public void saveCopy(long workspaceId, String relativePath, Path destination) throws Exception {
         Map<String, String> ws = workspace(workspaceId);
-        if (ws == null) throw new IllegalArgumentException("Workspace not found");
+        if (ws == null)
+            throw new IllegalArgumentException("Workspace not found");
         Path source = safeResolve(workspaceDir(ws), relativePath);
-        if (!Files.exists(source)) throw new IllegalStateException("File is not available locally yet. Run Sync Now first.");
+        if (!Files.exists(source))
+            throw new IllegalStateException("File is not available locally yet. Run Sync Now first.");
         Files.copy(source, destination, StandardCopyOption.REPLACE_EXISTING);
     }
 
     public void openWorkspace(long workspaceId) throws Exception {
         Path p = workspaceDir(workspaceId);
-        if (p != null) { Files.createDirectories(p); Desktop.getDesktop().open(p.toFile()); }
+        if (p != null) {
+            Files.createDirectories(p);
+            Desktop.getDesktop().open(p.toFile());
+        }
     }
 
     public boolean canManageWorkspace(Map<String, String> ws) {
@@ -410,7 +546,8 @@ public class AgentService implements AutoCloseable {
     }
 
     public boolean allowed(Map<String, String> ws, String action) {
-        if (isAdmin()) return true;
+        if (isAdmin())
+            return true;
         String key = switch (action.toUpperCase(Locale.ROOT)) {
             case "CREATE", "WRITE" -> "can_write";
             case "MODIFY" -> "can_modify";
@@ -421,8 +558,10 @@ public class AgentService implements AutoCloseable {
     }
 
     public void changeSyncRoot(Path root) throws Exception {
-        config.setSyncRoot(root); config.save();
-        for (FolderWatcher w : watchers.values()) w.close();
+        config.setSyncRoot(root);
+        config.save();
+        for (FolderWatcher w : watchers.values())
+            w.close();
         watchers.clear();
         Files.createDirectories(root);
         state = new LocalStateStore(root);
@@ -431,7 +570,8 @@ public class AgentService implements AutoCloseable {
     }
 
     private boolean isLocalDirty(long workspaceId, String relativePath, Path localFile) throws Exception {
-        if (!Files.isRegularFile(localFile)) return false;
+        if (!Files.isRegularFile(localFile))
+            return false;
         String knownChecksum = state.checksum(workspaceId, relativePath);
         String currentChecksum = HashUtil.sha256(localFile);
         return !Objects.equals(currentChecksum, knownChecksum);
@@ -459,25 +599,96 @@ public class AgentService implements AutoCloseable {
         return conflict;
     }
 
-    public void setNotificationListener(BiConsumer<String, String> listener) { this.notificationListener = listener; }
-    private void notify(String level, String message) { notificationListener.accept(level, message); }
+    public void setNotificationListener(BiConsumer<String, String> listener) {
+        this.notificationListener = listener;
+    }
+
+    private void scheduleDeferredSync(String key, String rel) {
+        if (!pendingDeferredSync.add(key))
+            return;
+        syncScheduler.schedule(() -> {
+            try {
+                pendingDeferredSync.remove(key);
+                syncNow();
+            } catch (Exception e) {
+                warnOnce(key, "Deferred sync for " + rel + " failed: " + e.getMessage());
+                scheduleDeferredSync(key, rel);
+            }
+        }, 3, TimeUnit.SECONDS);
+    }
+
+    private void scheduleLocalUploadRetry(String key, long ws, String rel) {
+        if (!pendingLocalUploadRetry.add(key))
+            return;
+        syncScheduler.schedule(() -> {
+            try {
+                pendingLocalUploadRetry.remove(key);
+                Map<String, String> workspace = workspace(ws);
+                if (workspace == null)
+                    return;
+                Path file = safeResolve(workspaceDir(workspace), rel);
+                if (!Files.isRegularFile(file))
+                    return;
+                if (isLocalDirty(ws, rel, file)) {
+                    uploadLocalChange(ws, rel, "MODIFY");
+                } else {
+                    syncNow();
+                }
+            } catch (Exception e) {
+                warnOnce(key, "Deferred local upload for " + rel + " failed: " + e.getMessage());
+                scheduleLocalUploadRetry(key, ws, rel);
+            }
+        }, 3, TimeUnit.SECONDS);
+    }
+
+    private void warnOnce(String key, String message) {
+        if (suppressedWarnings.add(key))
+            notify("WARN", message);
+    }
+
+    private void notify(String level, String message) {
+        if ("WARN".equalsIgnoreCase(level)) {
+            String normalizedKey = "warn:" + level + ":" + message.replaceAll("\\d{8}_\\d{6}_\\d{3}", "<time>")
+                    .replaceAll("[_-]conflict_[A-Za-z0-9_-]+", "_conflict_");
+            if (!suppressedWarnings.add(normalizedKey))
+                return;
+        }
+        notificationListener.accept(level, message);
+    }
 
     private Map<String, String> workspace(long id) {
-        for (Map<String, String> w : workspaces) if (parseLong(w.get("id"), -1) == id) return w;
+        for (Map<String, String> w : workspaces)
+            if (parseLong(w.get("id"), -1) == id)
+                return w;
         return null;
     }
+
     private Path safeResolve(Path root, String rel) {
         Path p = root.resolve(rel.replace('/', java.io.File.separatorChar)).normalize();
-        if (!p.startsWith(root.normalize())) throw new IllegalArgumentException("Unsafe file path");
+        if (!p.startsWith(root.normalize()))
+            throw new IllegalArgumentException("Unsafe file path");
         return p;
     }
-    private long parseLong(String s, long d) { try { return Long.parseLong(s); } catch (Exception e) { return d; } }
-    private boolean truthy(String s) { return "1".equals(s) || "true".equalsIgnoreCase(s); }
 
-    @Override public void close() {
-        for (FolderWatcher w : watchers.values()) w.close();
+    private long parseLong(String s, long d) {
+        try {
+            return Long.parseLong(s);
+        } catch (Exception e) {
+            return d;
+        }
+    }
+
+    private boolean truthy(String s) {
+        return "1".equals(s) || "true".equalsIgnoreCase(s);
+    }
+
+    @Override
+    public void close() {
+        for (FolderWatcher w : watchers.values())
+            w.close();
         watchers.clear();
         workers.shutdownNow();
+        syncScheduler.shutdownNow();
         network.close();
     }
 }
