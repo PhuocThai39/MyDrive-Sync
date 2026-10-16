@@ -75,11 +75,13 @@ public class WorkspacePanel extends JPanel {
         JPanel b = new JPanel(new FlowLayout(FlowLayout.LEFT));
         JButton upload = new JButton("Upload");
         JButton copy = new JButton("Save a Copy");
+        JButton history = new JButton("Version History");
         JButton delete = new JButton("Delete");
         JButton open = new JButton("Open Local Folder");
         JButton sync = new JButton("Sync Now");
         upload.addActionListener(e -> upload());
         copy.addActionListener(e -> saveCopy());
+        history.addActionListener(e -> showHistory());
         delete.addActionListener(e -> deleteSelected());
         open.addActionListener(e -> openFolder());
         sync.addActionListener(e -> UiAsync.run(() -> {
@@ -88,6 +90,7 @@ public class WorkspacePanel extends JPanel {
         }, x -> loadSelected(), ex -> UiAsync.error(this, ex)));
         b.add(upload);
         b.add(copy);
+        b.add(history);
         b.add(delete);
         b.add(open);
         b.add(sync);
@@ -200,6 +203,64 @@ public class WorkspacePanel extends JPanel {
                 return null;
             }, x -> {
             }, ex -> UiAsync.error(this, ex));
+    }
+
+    private void showHistory() {
+        WorkspaceItem w = selected();
+        Map<String, String> f = selectedFile();
+        if (w == null)
+            return;
+        String relativePath = f == null ? "" : f.get("relative_path");
+        String title = f == null ? "Workspace History" : "Version History: " + relativePath;
+
+        UiAsync.run(() -> service.listFileHistory(w.id(), relativePath), rows -> {
+            DefaultTableModel historyModel = f == null
+                    ? model("File", "Version", "Action", "Size (bytes)", "Changed By", "Time", "Snapshot")
+                    : model("Version", "Action", "Size (bytes)", "Changed By", "Time", "Snapshot");
+            JTable historyTable = new JTable(historyModel);
+            for (Map<String, String> row : rows) {
+                Object[] values = { row.get("relative_path"), row.get("version"), row.get("change_type"),
+                        row.get("size"), row.get("created_by"), row.get("created_at"),
+                        truthy(row.get("has_snapshot")) ? "Available" : "Unavailable" };
+                historyModel.addRow(f == null ? values : new Object[] { values[1], values[2], values[3],
+                        values[4], values[5], values[6] });
+            }
+
+            JDialog dialog = new JDialog(SwingUtilities.getWindowAncestor(this),
+                    title, Dialog.ModalityType.APPLICATION_MODAL);
+            dialog.setLayout(new BorderLayout(8, 8));
+            dialog.add(new JScrollPane(historyTable), BorderLayout.CENTER);
+            JButton restore = new JButton("Restore Selected Version");
+            restore.setEnabled(service.allowed(w.row(), "MODIFY"));
+            restore.addActionListener(e -> {
+                int selected = historyTable.getSelectedRow();
+                if (selected < 0)
+                    return;
+                Map<String, String> snapshot = rows.get(historyTable.convertRowIndexToModel(selected));
+                if (!truthy(snapshot.get("has_snapshot"))) {
+                    warn("The file content for this history entry is no longer available.");
+                    return;
+                }
+                String snapshotPath = snapshot.get("relative_path");
+                if (JOptionPane.showConfirmDialog(dialog,
+                        "Restore version " + snapshot.get("version") + " of " + snapshotPath + "?",
+                        "Confirm Restore", JOptionPane.YES_NO_OPTION) != JOptionPane.YES_OPTION)
+                    return;
+                UiAsync.run(() -> {
+                    service.restoreSnapshot(Long.parseLong(snapshot.get("id")));
+                    return null;
+                }, result -> {
+                    dialog.dispose();
+                    loadSelected();
+                }, ex -> UiAsync.error(dialog, ex));
+            });
+            JPanel actions = new JPanel(new FlowLayout(FlowLayout.RIGHT));
+            actions.add(restore);
+            dialog.add(actions, BorderLayout.SOUTH);
+            dialog.setSize(760, 360);
+            dialog.setLocationRelativeTo(this);
+            dialog.setVisible(true);
+        }, ex -> UiAsync.error(this, ex));
     }
 
     private void deleteSelected() {

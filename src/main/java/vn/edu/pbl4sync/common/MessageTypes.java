@@ -40,6 +40,10 @@ public final class MessageTypes {
     public static final String FILE_FETCH_REQUEST = "FILE_FETCH_REQUEST";
     public static final String FILE_UPLOAD_REQUEST = "FILE_UPLOAD_REQUEST";
     public static final String FILE_EVENT_RESULT = "FILE_EVENT_RESULT";
+    public static final String FILE_HISTORY_REQUEST = "FILE_HISTORY_REQUEST";
+    public static final String FILE_HISTORY_RESPONSE = "FILE_HISTORY_RESPONSE";
+    public static final String FILE_RESTORE_REQUEST = "FILE_RESTORE_REQUEST";
+    public static final String FILE_RESTORE_RESULT = "FILE_RESTORE_RESULT";
 
     public static final String SYNC_REPORT = "SYNC_REPORT";
     public static final String SYNC_REPORT_RESULT = "SYNC_REPORT_RESULT";

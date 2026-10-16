@@ -113,6 +113,21 @@ public class AgentService implements AutoCloseable {
                 .decode(request(Packet.request(LIST_FILES_REQUEST).with("workspaceId", workspaceId)).get("rows"));
     }
 
+    public List<Map<String, String>> listFileHistory(long workspaceId, String relativePath) throws Exception {
+        return TableCodec.decode(request(Packet.request(FILE_HISTORY_REQUEST)
+                .with("workspaceId", workspaceId)
+                .with("path", relativePath)).get("rows"));
+    }
+
+    public void restoreSnapshot(long snapshotId) throws Exception {
+        Packet response = network.request(
+                Packet.request(FILE_RESTORE_REQUEST).with("snapshotId", snapshotId), Duration.ofMinutes(5));
+        if (ERROR.equals(response.type()))
+            throw new IllegalStateException(response.get("message"));
+        if (!FILE_RESTORE_RESULT.equals(response.type()))
+            throw new IllegalStateException("Unexpected response while restoring file snapshot");
+    }
+
     public List<Map<String, String>> listMembers(long workspaceId) throws Exception {
         return TableCodec
                 .decode(request(Packet.request(LIST_MEMBERS_REQUEST).with("workspaceId", workspaceId)).get("rows"));
@@ -501,8 +516,6 @@ public class AgentService implements AutoCloseable {
 
         long baseVersion = state.version(workspaceId, relativePath);
         Path local = safeResolve(workspaceDir(ws), relativePath);
-        ignore.ignore(local, 3000);
-        Files.deleteIfExists(local);
 
         Packet p = Packet.request(FILE_EVENT)
                 .with("workspaceId", workspaceId)
@@ -520,6 +533,8 @@ public class AgentService implements AutoCloseable {
             return;
         }
 
+        ignore.ignore(local, 3000);
+        Files.deleteIfExists(local);
         state.put(workspaceId, relativePath, r.getLong("version", 0), "");
     }
 

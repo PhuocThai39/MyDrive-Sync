@@ -7,7 +7,11 @@ import java.time.LocalDateTime;
 import java.util.*;
 
 public class Database implements AutoCloseable {
+    public static final long SNAPSHOT_QUOTA_BYTES = 100L * 1024 * 1024;
     private final SimpleConnectionPool pool;
+
+    public record FileChangeResult(Map<String, String> file, List<String> removedSnapshotPaths) { }
+    public record SnapshotRestoreResult(Map<String, String> file, List<String> removedSnapshotPaths) { }
 
     public Database(String url, String user, String password, int poolSize, String initialAdminPassword) throws Exception {
         Class.forName("com.mysql.cj.jdbc.Driver");
@@ -92,6 +96,26 @@ public class Database implements AutoCloseable {
               PRIMARY KEY(file_id, agent_id),
               CONSTRAINT fk_rep_file FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE,
               CONSTRAINT fk_rep_agent FOREIGN KEY(agent_id) REFERENCES agents(id) ON DELETE CASCADE
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS file_snapshots (
+              id BIGINT PRIMARY KEY AUTO_INCREMENT,
+              workspace_id BIGINT NOT NULL,
+              file_id BIGINT NOT NULL,
+              relative_path VARCHAR(700) NOT NULL,
+              version BIGINT NOT NULL,
+              size BIGINT NOT NULL DEFAULT 0,
+              checksum VARCHAR(128) NOT NULL DEFAULT '',
+              snapshot_path VARCHAR(1200),
+              change_type VARCHAR(20) NOT NULL,
+              created_by BIGINT,
+              created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              UNIQUE KEY uq_snapshot_file_version(file_id,version),
+              INDEX idx_snapshot_workspace_time(workspace_id,created_at),
+              CONSTRAINT fk_snapshot_workspace FOREIGN KEY(workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE,
+              CONSTRAINT fk_snapshot_file FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE,
+              CONSTRAINT fk_snapshot_user FOREIGN KEY(created_by) REFERENCES users(id) ON DELETE SET NULL
             )
             """,
             """
@@ -358,24 +382,29 @@ public class Database implements AutoCloseable {
         return row == null ? "" : row.getOrDefault("workspace_role", "");
     }
 
-    public Map<String, String> applyFileChange(long workspaceId, String path, long size, String checksum,
-                                                    long userId, long baseVersion, boolean deleted) throws SQLException {
+    public FileChangeResult applyFileChange(long workspaceId, String path, long size, String checksum,
+                                            long userId, long baseVersion, boolean deleted,
+                                            String snapshotPath) throws SQLException {
         Connection c = pool.borrow();
         try {
             c.setAutoCommit(false);
+            queryOne(c, "SELECT id FROM workspaces WHERE id=? FOR UPDATE", workspaceId);
             Map<String, String> existing = queryOne(c,
                     "SELECT id,size,checksum,version,deleted FROM files WHERE workspace_id=? AND relative_path=? FOR UPDATE",
                     workspaceId, path);
 
             long id;
             long version;
+            List<String> removedSnapshotPaths = new ArrayList<>();
 
             if (existing == null) {
                 // A truly new path must be based on version 0. If the Agent claims it
                 // edited/deleted a version that the server does not have, do not guess.
                 if (baseVersion != 0) {
                     c.rollback();
-                    return row("conflict", true, "current_version", 0, "current_checksum", "", "current_deleted", true);
+                    return new FileChangeResult(
+                            row("conflict", true, "current_version", 0, "current_checksum", "", "current_deleted", true),
+                            List.of());
                 }
 
                 try (PreparedStatement ps = c.prepareStatement(
@@ -399,14 +428,14 @@ public class Database implements AutoCloseable {
                 // exactly the version on which its local edit/delete was based.
                 if (baseVersion != currentVersion) {
                     c.rollback();
-                    return row(
-                            "conflict", true,
-                            "id", id,
-                            "current_version", currentVersion,
-                            "current_checksum", existing.getOrDefault("checksum", ""),
-                            "current_deleted", existing.getOrDefault("deleted", "false"),
-                            "current_size", existing.getOrDefault("size", "0")
-                    );
+                    return new FileChangeResult(row(
+                                "conflict", true,
+                                "id", id,
+                                "current_version", currentVersion,
+                                "current_checksum", existing.getOrDefault("checksum", ""),
+                                "current_deleted", existing.getOrDefault("deleted", "false"),
+                                "current_size", existing.getOrDefault("size", "0")
+                            ), List.of());
                 }
 
                 version = currentVersion + 1;
@@ -422,8 +451,13 @@ public class Database implements AutoCloseable {
                 }
             }
 
+            boolean newContent = existing == null || truthy(existing.get("deleted"));
+            insertSnapshot(c, workspaceId, id, path, version, deleted ? 0 : size,
+                    deleted ? "" : checksum, deleted ? null : snapshotPath,
+                    deleted ? "DELETE" : (newContent ? "CREATE" : "MODIFY"), userId);
+            removedSnapshotPaths.addAll(pruneSnapshots(c, workspaceId));
             c.commit();
-            return row(
+            return new FileChangeResult(row(
                     "conflict", false,
                     "id", id,
                     "workspace_id", workspaceId,
@@ -432,7 +466,7 @@ public class Database implements AutoCloseable {
                     "checksum", checksum,
                     "version", version,
                     "deleted", deleted
-            );
+            ), removedSnapshotPaths);
         } catch (SQLException e) {
             try { c.rollback(); } catch (SQLException ignored) { }
             throw e;
@@ -440,6 +474,194 @@ public class Database implements AutoCloseable {
             try { c.setAutoCommit(true); } catch (SQLException ignored) { }
             pool.release(c);
         }
+    }
+
+    public List<Map<String, String>> listFileSnapshots(long workspaceId, String relativePath) throws SQLException {
+        return query("""
+            SELECT s.id,s.file_id,s.relative_path,s.version,s.size,s.checksum,s.change_type,s.created_at,
+                   COALESCE(u.username,'') created_by,
+                   CASE WHEN s.snapshot_path IS NULL THEN 0 ELSE 1 END has_snapshot
+            FROM file_snapshots s
+            LEFT JOIN users u ON u.id=s.created_by
+            WHERE s.workspace_id=? AND (?='' OR s.relative_path=?)
+              AND s.created_at >= DATE_SUB(NOW(), INTERVAL 3 DAY)
+            ORDER BY s.version DESC
+            """, workspaceId, relativePath, relativePath);
+    }
+
+    public Map<String, String> findFileSnapshot(long snapshotId) throws SQLException {
+        return queryOne("""
+            SELECT id,workspace_id,file_id,relative_path,version,size,checksum,snapshot_path,change_type,created_at
+            FROM file_snapshots
+            WHERE id=? AND created_at >= DATE_SUB(NOW(), INTERVAL 3 DAY)
+            """, snapshotId);
+    }
+
+    public Map<String, String> findSnapshotForVersion(long fileId, long version) throws SQLException {
+        return queryOne("""
+            SELECT id,workspace_id,file_id,relative_path,version,size,checksum,snapshot_path,change_type,created_at
+            FROM file_snapshots
+            WHERE file_id=? AND version=? AND snapshot_path IS NOT NULL
+              AND created_at >= DATE_SUB(NOW(), INTERVAL 3 DAY)
+            """, fileId, version);
+    }
+
+    public SnapshotRestoreResult restoreSnapshot(long snapshotId, String restoredSnapshotPath,
+                                                 long userId) throws SQLException {
+        Connection c = pool.borrow();
+        try {
+            c.setAutoCommit(false);
+            Map<String, String> source = queryOne(c,
+                    "SELECT workspace_id,file_id,relative_path,size,checksum,snapshot_path FROM file_snapshots WHERE id=?",
+                    snapshotId);
+            if (source == null || source.getOrDefault("snapshot_path", "").isBlank()) {
+                c.rollback();
+                return null;
+            }
+
+            long workspaceId = Long.parseLong(source.get("workspace_id"));
+            long fileId = Long.parseLong(source.get("file_id"));
+            queryOne(c, "SELECT id FROM workspaces WHERE id=? FOR UPDATE", workspaceId);
+            source = queryOne(c,
+                    """
+                    SELECT workspace_id,file_id,relative_path,size,checksum,snapshot_path FROM file_snapshots
+                    WHERE id=? AND created_at >= DATE_SUB(NOW(), INTERVAL 3 DAY) FOR UPDATE
+                    """,
+                    snapshotId);
+            if (source == null || source.getOrDefault("snapshot_path", "").isBlank()) {
+                c.rollback();
+                return null;
+            }
+
+            Map<String, String> current = queryOne(c,
+                    "SELECT version FROM files WHERE id=? AND workspace_id=? FOR UPDATE", fileId, workspaceId);
+            if (current == null) {
+                c.rollback();
+                return null;
+            }
+
+            long version = Long.parseLong(current.get("version")) + 1;
+            long size = Long.parseLong(source.get("size"));
+            String checksum = source.get("checksum");
+            try (PreparedStatement ps = c.prepareStatement(
+                    "UPDATE files SET size=?,checksum=?,version=?,modified_by=?,modified_at=NOW(),deleted=0 WHERE id=?")) {
+                ps.setLong(1, size);
+                ps.setString(2, checksum);
+                ps.setLong(3, version);
+                ps.setLong(4, userId);
+                ps.setLong(5, fileId);
+                ps.executeUpdate();
+            }
+
+            List<String> removedSnapshotPaths = new ArrayList<>();
+            insertSnapshot(c, workspaceId, fileId, source.get("relative_path"), version, size, checksum,
+                    restoredSnapshotPath, "RESTORE", userId);
+            removedSnapshotPaths.addAll(pruneSnapshots(c, workspaceId));
+            c.commit();
+            return new SnapshotRestoreResult(row(
+                    "id", fileId,
+                    "workspace_id", workspaceId,
+                    "relative_path", source.get("relative_path"),
+                    "size", size,
+                    "checksum", checksum,
+                    "version", version,
+                    "deleted", false
+            ), removedSnapshotPaths);
+        } catch (SQLException e) {
+            try { c.rollback(); } catch (SQLException ignored) { }
+            throw e;
+        } finally {
+            try { c.setAutoCommit(true); } catch (SQLException ignored) { }
+            pool.release(c);
+        }
+    }
+
+    public List<String> pruneSnapshots() throws SQLException {
+        List<String> removed = new ArrayList<>();
+        for (Map<String, String> workspace : query("SELECT id FROM workspaces")) {
+            long workspaceId = Long.parseLong(workspace.get("id"));
+            Connection c = pool.borrow();
+            try {
+                c.setAutoCommit(false);
+                queryOne(c, "SELECT id FROM workspaces WHERE id=? FOR UPDATE", workspaceId);
+                removed.addAll(pruneSnapshots(c, workspaceId));
+                c.commit();
+            } catch (SQLException e) {
+                try { c.rollback(); } catch (SQLException ignored) { }
+                throw e;
+            } finally {
+                try { c.setAutoCommit(true); } catch (SQLException ignored) { }
+                pool.release(c);
+            }
+        }
+        return removed;
+    }
+
+    public List<String> snapshotPathsForWorkspace(long workspaceId) throws SQLException {
+        List<String> paths = new ArrayList<>();
+        for (Map<String, String> row : query(
+                "SELECT snapshot_path FROM file_snapshots WHERE workspace_id=? AND snapshot_path IS NOT NULL",
+                workspaceId)) {
+            paths.add(row.get("snapshot_path"));
+        }
+        return paths;
+    }
+
+    public Set<String> allSnapshotPaths() throws SQLException {
+        Set<String> paths = new HashSet<>();
+        for (Map<String, String> row : query(
+                "SELECT snapshot_path FROM file_snapshots WHERE snapshot_path IS NOT NULL")) {
+            paths.add(row.get("snapshot_path"));
+        }
+        return paths;
+    }
+
+    private void insertSnapshot(Connection c, long workspaceId, long fileId, String path, long version,
+                                long size, String checksum, String snapshotPath, String changeType,
+                                long userId) throws SQLException {
+        try (PreparedStatement ps = c.prepareStatement("""
+                INSERT INTO file_snapshots(workspace_id,file_id,relative_path,version,size,checksum,snapshot_path,change_type,created_by)
+                VALUES(?,?,?,?,?,?,?,?,?)
+                """)) {
+            ps.setLong(1, workspaceId);
+            ps.setLong(2, fileId);
+            ps.setString(3, path);
+            ps.setLong(4, version);
+            ps.setLong(5, size);
+            ps.setString(6, checksum);
+            if (snapshotPath == null) ps.setNull(7, Types.VARCHAR); else ps.setString(7, snapshotPath);
+            ps.setString(8, changeType);
+            ps.setLong(9, userId);
+            ps.executeUpdate();
+        }
+    }
+
+    private List<String> pruneSnapshots(Connection c, long workspaceId) throws SQLException {
+        List<String> removedPaths = new ArrayList<>();
+        for (Map<String, String> expired : query(c, """
+                SELECT id,snapshot_path FROM file_snapshots
+                WHERE workspace_id=? AND created_at < DATE_SUB(NOW(), INTERVAL 3 DAY)
+                """, workspaceId)) {
+            if (!expired.getOrDefault("snapshot_path", "").isBlank())
+                removedPaths.add(expired.get("snapshot_path"));
+            update(c, "DELETE FROM file_snapshots WHERE id=?", Long.parseLong(expired.get("id")));
+        }
+
+        List<Map<String, String>> snapshots = query(c, """
+                SELECT id,size,snapshot_path FROM file_snapshots
+                WHERE workspace_id=? AND snapshot_path IS NOT NULL
+                ORDER BY created_at ASC,id ASC FOR UPDATE
+                """, workspaceId);
+        long totalBytes = 0;
+        for (Map<String, String> snapshot : snapshots)
+            totalBytes += Long.parseLong(snapshot.get("size"));
+        for (Map<String, String> snapshot : snapshots) {
+            if (totalBytes <= SNAPSHOT_QUOTA_BYTES) break;
+            update(c, "DELETE FROM file_snapshots WHERE id=?", Long.parseLong(snapshot.get("id")));
+            removedPaths.add(snapshot.get("snapshot_path"));
+            totalBytes -= Long.parseLong(snapshot.get("size"));
+        }
+        return removedPaths;
     }
 
     public void markReplica(long fileId, long agentId, long version, String checksum) throws SQLException {
@@ -592,6 +814,13 @@ public class Database implements AutoCloseable {
         } finally { pool.release(c); }
     }
 
+    private void update(Connection c, String sql, Object... params) throws SQLException {
+        try (PreparedStatement ps = c.prepareStatement(sql)) {
+            bind(ps, params);
+            ps.executeUpdate();
+        }
+    }
+
     private List<Map<String, String>> query(String sql, Object... params) throws SQLException {
         Connection c = pool.borrow();
         try { return query(c, sql, params); } finally { pool.release(c); }
@@ -636,6 +865,10 @@ public class Database implements AutoCloseable {
             else if (p instanceof Boolean v) ps.setBoolean(i + 1, v);
             else ps.setString(i + 1, String.valueOf(p));
         }
+    }
+
+    private boolean truthy(String value) {
+        return "1".equals(value) || "true".equalsIgnoreCase(value);
     }
 
     private Map<String, String> row(Object... kv) {
