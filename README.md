@@ -241,17 +241,6 @@ Activity Log
 
 File thật được lưu tại các Agent; Server chủ yếu quản lý metadata và điều phối đồng bộ.
 
-### Lịch sử phiên bản, rollback và backup
-
-- Mỗi nội dung file được Server chấp nhận sẽ được lưu thành một snapshot riêng tại `server-data/snapshots/` trên máy chạy Server.
-- Snapshot được giữ tối đa 3 ngày. Mỗi workspace có hạn mức 100 MB; khi vượt hạn mức, snapshot cũ nhất được loại bỏ trước để nhường chỗ.
-- File có kích thước lớn hơn 100 MB không được đồng bộ, nhằm tránh thay đổi mà không thể lưu snapshot.
-- Mọi thành viên workspace có thể xem metadata lịch sử; quyền Read hiện hành vẫn quyết định Agent nào nhận nội dung file.
-- Nội dung chỉ có thể khôi phục khi snapshot tương ứng còn tồn tại. Admin, Leader và thành viên có quyền Modify có thể khôi phục.
-- Khôi phục tạo version mới, gửi nội dung tới các Agent đang online có quyền Read và thông báo trong workspace. Agent offline sẽ nhận phiên bản hiện hành khi đồng bộ lại.
-- Chỉ các phiên bản được tạo sau khi bật tính năng mới có nội dung snapshot; dữ liệu file cũ không thể được tạo ngược lại từ metadata.
-- Đảm bảo thư mục `server-data/snapshots/` nằm trên ổ đĩa được bảo vệ và có đủ dung lượng; bản này không tạo bản backup thứ hai ngoài máy Server.
-
 10. Workflow Git đề xuất cho nhóm
 
 Không nên code trực tiếp toàn bộ trên main.

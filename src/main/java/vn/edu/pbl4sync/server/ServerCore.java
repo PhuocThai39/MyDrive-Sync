@@ -24,35 +24,18 @@ public class ServerCore implements AutoCloseable {
     private final Map<String, RelayTicket> relayTickets = new ConcurrentHashMap<>();
     private ExecutorService clientPool;
     private ExecutorService transferPool;
-    private ScheduledExecutorService snapshotMaintenance;
     private volatile boolean running;
     private ServerSocket serverSocket;
     private Database db;
-    private SnapshotStore snapshotStore;
 
     public ServerCore(ServerConfig config) { this.config = config; }
 
     public synchronized void start() throws Exception {
         if (running) return;
         db = new Database(config.dbUrl(), config.dbUser(), config.dbPassword(), config.dbPoolSize(), config.initialAdminPassword());
-        snapshotStore = new SnapshotStore(Path.of("server-data", "snapshots"));
-        deleteStoredSnapshots(db.pruneSnapshots());
-        try {
-            snapshotStore.deleteOrphans(db.allSnapshotPaths());
-        } catch (IOException e) {
-            log("Snapshot orphan cleanup failed: " + e.getMessage());
-        }
         clientPool = Executors.newFixedThreadPool(config.clientThreads());
         transferPool = Executors.newFixedThreadPool(config.transferThreads());
         serverSocket = new ServerSocket(config.port());
-        snapshotMaintenance = Executors.newSingleThreadScheduledExecutor();
-        snapshotMaintenance.scheduleAtFixedRate(() -> {
-            try {
-                deleteStoredSnapshots(db.pruneSnapshots());
-            } catch (Exception e) {
-                log("Snapshot retention cleanup failed: " + e.getMessage());
-            }
-        }, 15, 15, TimeUnit.MINUTES);
         running = true;
         log("Server started on port " + config.port());
         Thread acceptThread = new Thread(this::acceptLoop, "server-accept");
@@ -85,8 +68,6 @@ public class ServerCore implements AutoCloseable {
             case DASHBOARD_REQUEST -> dashboard(session, p);
             case LIST_WORKSPACES_REQUEST -> listWorkspaces(session, p);
             case LIST_FILES_REQUEST -> listFiles(session, p);
-            case FILE_HISTORY_REQUEST -> fileHistory(session, p);
-            case FILE_RESTORE_REQUEST -> restoreSnapshot(session, p);
             case LIST_MEMBERS_REQUEST -> listMembers(session, p);
             case LIST_USERS_REQUEST -> listUsers(session, p);
             case LIST_AGENTS_REQUEST -> listAgents(session, p);
@@ -240,68 +221,10 @@ public class ServerCore implements AutoCloseable {
     private void deleteWorkspace(ClientSession s, Packet p) throws Exception {
         requireAdmin(s);
         long ws = p.getLong("workspaceId", 0);
-        List<String> snapshotPaths = db.snapshotPathsForWorkspace(ws);
         db.logActivity(s.userId(), ws, "DELETE_WORKSPACE", "workspace=" + ws);
         db.deleteWorkspace(ws);
-        deleteStoredSnapshots(snapshotPaths);
         s.send(p.response(OK));
         broadcastWorkspacesChanged();
-    }
-
-    private void fileHistory(ClientSession s, Packet p) throws Exception {
-        long ws = p.getLong("workspaceId", 0);
-        String path = p.get("path").isBlank() ? "" : sanitizeRelativePath(p.get("path"));
-        if (!s.isAdmin() && !db.isMember(s.userId(), ws))
-            throw new SecurityException("Not a workspace member");
-        s.send(p.response(FILE_HISTORY_RESPONSE)
-                .with("rows", TableCodec.encode(db.listFileSnapshots(ws, path))));
-    }
-
-    private void restoreSnapshot(ClientSession s, Packet p) throws Exception {
-        long snapshotId = p.getLong("snapshotId", 0);
-        Map<String, String> snapshot = db.findFileSnapshot(snapshotId);
-        if (snapshot == null || snapshot.getOrDefault("snapshot_path", "").isBlank())
-            throw new IllegalArgumentException("Snapshot is no longer available");
-
-        long ws = parseLong(snapshot.get("workspace_id"), 0);
-        if (!s.isAdmin() && !db.isLeader(s.userId(), ws)
-                && !db.hasPermission(s.userId(), false, ws, "MODIFY"))
-            throw new SecurityException("Restore requires MODIFY permission");
-
-        Path source = snapshotStore.resolve(snapshot.get("snapshot_path"));
-        if (!Files.isRegularFile(source)
-                || Files.size(source) != parseLong(snapshot.get("size"), -1)
-                || !Objects.equals(HashUtil.sha256(source), snapshot.get("checksum")))
-            throw new IOException("Snapshot is missing or failed integrity verification");
-
-        Path restoredSnapshot = snapshotStore.stage(ws, source);
-        Database.SnapshotRestoreResult result = db.restoreSnapshot(
-                snapshotId, snapshotStore.storedPath(restoredSnapshot), s.userId());
-        if (result == null) {
-            snapshotStore.delete(restoredSnapshot);
-            throw new IllegalStateException("Snapshot expired or was removed before it could be restored");
-        }
-        deleteStoredSnapshots(result.removedSnapshotPaths());
-
-        Map<String, String> file = result.file();
-        Path delivery = Files.createTempFile("pbl4sync-restore-", ".tmp");
-        Files.copy(restoredSnapshot, delivery, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
-        Packet deliver = Packet.event(FILE_DELIVER)
-                .with("workspaceId", ws)
-                .with("path", file.get("relative_path"))
-                .with("fileId", file.get("id"))
-                .with("version", file.get("version"))
-                .with("checksum", file.get("checksum"))
-                .with("size", file.get("size"))
-                .with("conflict", false);
-        broadcastToWorkspace(ws, deliver, delivery, 0);
-        notifyWorkspace(ws, file.get("relative_path") + " was restored to v" + file.get("version")
-                + " by " + s.username(), -1);
-        db.logActivity(s.userId(), ws, "RESTORE_FILE",
-                file.get("relative_path") + " restored as v" + file.get("version"));
-        s.send(p.response(FILE_RESTORE_RESULT)
-                .with("version", file.get("version"))
-                .with("path", file.get("relative_path")));
     }
 
     private void fileEvent(ClientSession s, ReceivedPacket received) throws Exception {
@@ -321,41 +244,19 @@ public class ServerCore implements AutoCloseable {
         boolean deleted = "DELETE".equals(action);
         long baseVersion = p.getLong("baseVersion", 0);
         Path cached = null;
-        Path snapshot = null;
         long size = 0;
         String checksum = "";
         if (!deleted) {
             if (received.payloadPath() == null) throw new IllegalArgumentException("File payload required");
             size = Files.size(received.payloadPath());
             checksum = HashUtil.sha256(received.payloadPath());
-            snapshot = snapshotStore.stage(ws, received.payloadPath());
-            try {
-                cached = Files.createTempFile("pbl4sync-relay-", ".tmp");
-                Files.copy(received.payloadPath(), cached, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
-            } catch (IOException e) {
-                if (cached != null) {
-                    try {
-                        Files.deleteIfExists(cached);
-                    } catch (IOException cleanupError) {
-                        e.addSuppressed(cleanupError);
-                    }
-                }
-                try {
-                    snapshotStore.delete(snapshot);
-                } catch (IOException cleanupError) {
-                    e.addSuppressed(cleanupError);
-                }
-                throw e;
-            }
+            cached = Files.createTempFile("pbl4sync-relay-", ".tmp");
+            Files.copy(received.payloadPath(), cached, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
         }
 
-        Database.FileChangeResult change = db.applyFileChange(ws, path, size, checksum, s.userId(), baseVersion,
-                deleted, snapshot == null ? null : snapshotStore.storedPath(snapshot));
-        deleteStoredSnapshots(change.removedSnapshotPaths());
-        Map<String, String> file = change.file();
+        Map<String, String> file = db.applyFileChange(ws, path, size, checksum, s.userId(), baseVersion, deleted);
         if (truthy(file.get("conflict"))) {
             if (cached != null) Files.deleteIfExists(cached);
-            if (snapshot != null) snapshotStore.delete(snapshot);
             s.send(p.response(FILE_EVENT_RESULT)
                     .with("success", false)
                     .with("conflict", true)
@@ -526,42 +427,9 @@ public class ServerCore implements AutoCloseable {
             source.send(fetch);
             return true;
         }
-        Map<String, String> serverSnapshot = db.findSnapshotForVersion(fileId, version);
-        if (serverSnapshot != null) {
-            Path stored = snapshotStore.resolve(serverSnapshot.get("snapshot_path"));
-            if (Files.isRegularFile(stored)
-                    && Files.size(stored) == parseLong(file.get("size"), -1)
-                    && Objects.equals(HashUtil.sha256(stored), file.get("checksum"))) {
-                Path delivery = Files.createTempFile("pbl4sync-snapshot-delivery-", ".tmp");
-                Files.copy(stored, delivery, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
-                Packet deliver = Packet.event(FILE_DELIVER)
-                        .with("workspaceId", file.get("workspace_id"))
-                        .with("path", file.get("relative_path"))
-                        .with("fileId", fileId)
-                        .with("version", version)
-                        .with("checksum", file.get("checksum"))
-                        .with("size", file.get("size"))
-                        .with("conflict", conflict);
-                sendAndDelete(target, deliver, delivery);
-                return true;
-            }
-            log("Stored snapshot failed integrity verification for " + file.get("relative_path")
-                    + " v" + version);
-        }
         target.send(Packet.event(NOTIFICATION).with("level", "WARN").with("message",
                 "Cannot sync " + file.get("relative_path") + ": no online Agent currently holds version " + version));
         return false;
-    }
-
-    private void deleteStoredSnapshots(List<String> paths) {
-        if (snapshotStore == null) return;
-        for (String path : paths) {
-            try {
-                snapshotStore.deleteStored(path);
-            } catch (IOException e) {
-                log("Could not remove expired snapshot " + path + ": " + e.getMessage());
-            }
-        }
     }
 
     private void broadcastToWorkspace(long workspaceId, Packet packet, Path payload, long excludeAgentId) throws Exception {
@@ -656,7 +524,6 @@ public class ServerCore implements AutoCloseable {
         for (ClientSession s : connections.all()) s.close();
         if (clientPool != null) clientPool.shutdownNow();
         if (transferPool != null) transferPool.shutdownNow();
-        if (snapshotMaintenance != null) snapshotMaintenance.shutdownNow();
         if (db != null) {
             try { db.markAllAgentsOffline(); } catch (Exception ignored) { }
             db.close();

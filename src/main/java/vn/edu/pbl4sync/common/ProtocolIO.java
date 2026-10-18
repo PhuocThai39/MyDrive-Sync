@@ -15,16 +15,10 @@ public final class ProtocolIO {
     private ProtocolIO() {}
 
     public static void send(OutputStream rawOut, Packet packet, Path payload) throws IOException {
-        long payloadLength = payload == null ? 0L : Files.size(payload);
-        Packet wirePacket = packet;
-        if (payloadLength == 0 && payload != null) {
-            Map<String, String> data = new LinkedHashMap<>(packet.data());
-            data.put("payloadPresent", "true");
-            wirePacket = new Packet(packet.type(), packet.requestId(), data);
-        }
-        byte[] header = encode(wirePacket);
+        byte[] header = encode(packet);
         if (header.length > MAX_HEADER_SIZE) throw new IOException("Header too large");
 
+        long payloadLength = payload == null ? 0L : Files.size(payload);
         DataOutputStream out = new DataOutputStream(rawOut);
         out.writeInt(header.length);
         out.write(header);
@@ -62,7 +56,7 @@ public final class ProtocolIO {
         if (payloadLength < 0) throw new IOException("Invalid payload length");
 
         Path temp = null;
-        if (payloadLength > 0 || packet.getBoolean("payloadPresent", false)) {
+        if (payloadLength > 0) {
             temp = Files.createTempFile("pbl4sync-payload-", ".tmp");
             try (OutputStream fileOut = new BufferedOutputStream(Files.newOutputStream(temp,
                     StandardOpenOption.TRUNCATE_EXISTING))) {

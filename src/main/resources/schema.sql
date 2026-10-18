@@ -70,25 +70,6 @@ CREATE TABLE IF NOT EXISTS file_replicas (
   FOREIGN KEY(agent_id) REFERENCES agents(id) ON DELETE CASCADE
 );
 
-CREATE TABLE IF NOT EXISTS file_snapshots (
-  id BIGINT PRIMARY KEY AUTO_INCREMENT,
-  workspace_id BIGINT NOT NULL,
-  file_id BIGINT NOT NULL,
-  relative_path VARCHAR(700) NOT NULL,
-  version BIGINT NOT NULL,
-  size BIGINT NOT NULL DEFAULT 0,
-  checksum VARCHAR(128) NOT NULL DEFAULT '',
-  snapshot_path VARCHAR(1200),
-  change_type VARCHAR(20) NOT NULL,
-  created_by BIGINT,
-  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  UNIQUE KEY uq_snapshot_file_version(file_id,version),
-  INDEX idx_snapshot_workspace_time(workspace_id,created_at),
-  FOREIGN KEY(workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE,
-  FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE,
-  FOREIGN KEY(created_by) REFERENCES users(id) ON DELETE SET NULL
-);
-
 CREATE TABLE IF NOT EXISTS activities (
   id BIGINT PRIMARY KEY AUTO_INCREMENT,
   user_id BIGINT,
