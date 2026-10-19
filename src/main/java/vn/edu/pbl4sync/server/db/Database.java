@@ -2,8 +2,11 @@ package vn.edu.pbl4sync.server.db;
 
 import vn.edu.pbl4sync.common.HashUtil;
 
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.sql.*;
-import java.time.LocalDateTime;
 import java.util.*;
 
 public class Database implements AutoCloseable {
@@ -92,6 +95,44 @@ public class Database implements AutoCloseable {
               PRIMARY KEY(file_id, agent_id),
               CONSTRAINT fk_rep_file FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE,
               CONSTRAINT fk_rep_agent FOREIGN KEY(agent_id) REFERENCES agents(id) ON DELETE CASCADE
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS file_versions (
+              id BIGINT PRIMARY KEY AUTO_INCREMENT,
+              file_id BIGINT NOT NULL,
+              version BIGINT NOT NULL,
+              base_version BIGINT NOT NULL,
+              checksum VARCHAR(128),
+              is_deleted BOOLEAN NOT NULL DEFAULT FALSE,
+              content LONGBLOB,
+              source_user_id BIGINT,
+              source_device VARCHAR(180) NOT NULL DEFAULT '',
+              operation VARCHAR(30) NOT NULL,
+              rollback_from_version BIGINT,
+              created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              UNIQUE KEY uq_file_version(file_id,version),
+              CONSTRAINT fk_file_version_file FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE,
+              CONSTRAINT fk_file_version_user FOREIGN KEY(source_user_id) REFERENCES users(id) ON DELETE SET NULL
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS file_conflicts (
+              id BIGINT PRIMARY KEY AUTO_INCREMENT,
+              file_id BIGINT NULL,
+              workspace_id BIGINT NOT NULL,
+              relative_path VARCHAR(700) NOT NULL,
+              base_version BIGINT NOT NULL,
+              current_version BIGINT NOT NULL,
+              checksum VARCHAR(128) NOT NULL,
+              content LONGBLOB NOT NULL,
+              source_user_id BIGINT,
+              source_device VARCHAR(180) NOT NULL DEFAULT '',
+              created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              INDEX idx_file_conflicts(file_id,created_at),
+              CONSTRAINT fk_conflict_file FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE SET NULL,
+              CONSTRAINT fk_conflict_workspace FOREIGN KEY(workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE,
+              CONSTRAINT fk_conflict_user FOREIGN KEY(source_user_id) REFERENCES users(id) ON DELETE SET NULL
             )
             """,
             """
@@ -359,7 +400,8 @@ public class Database implements AutoCloseable {
     }
 
     public Map<String, String> applyFileChange(long workspaceId, String path, long size, String checksum,
-                                                    long userId, long baseVersion, boolean deleted) throws SQLException {
+                                               long userId, String deviceName, long baseVersion,
+                                               boolean deleted, Path payload) throws Exception {
         Connection c = pool.borrow();
         try {
             c.setAutoCommit(false);
@@ -374,8 +416,13 @@ public class Database implements AutoCloseable {
                 // A truly new path must be based on version 0. If the Agent claims it
                 // edited/deleted a version that the server does not have, do not guess.
                 if (baseVersion != 0) {
-                    c.rollback();
-                    return row("conflict", true, "current_version", 0, "current_checksum", "", "current_deleted", true);
+                    if (!deleted) {
+                        saveConflict(c, null, workspaceId, path, baseVersion, 0, checksum,
+                                payload, userId, deviceName);
+                    }
+                    c.commit();
+                    return row("conflict", true, "current_version", 0, "current_checksum", "",
+                            "current_deleted", true);
                 }
 
                 try (PreparedStatement ps = c.prepareStatement(
@@ -391,20 +438,35 @@ public class Database implements AutoCloseable {
                     try (ResultSet rs = ps.getGeneratedKeys()) { rs.next(); id = rs.getLong(1); }
                 }
                 version = 1;
+                insertFileVersion(c, id, version, baseVersion, checksum, deleted, payload, userId,
+                        deviceName, deleted ? "DELETE" : "UPDATE", null);
             } else {
                 id = Long.parseLong(existing.get("id"));
                 long currentVersion = Long.parseLong(existing.get("version"));
+                boolean currentDeleted = Boolean.parseBoolean(existing.getOrDefault("deleted", "false"));
+                String currentChecksum = existing.getOrDefault("checksum", "");
+
+                if (currentDeleted == deleted && (deleted || currentChecksum.equals(checksum))) {
+                    c.commit();
+                    return row("conflict", false, "id", id, "workspace_id", workspaceId,
+                            "relative_path", path, "size", size, "checksum", currentChecksum,
+                            "version", currentVersion, "deleted", deleted, "unchanged", true);
+                }
 
                 // Optimistic concurrency check: the Agent is only allowed to change
                 // exactly the version on which its local edit/delete was based.
                 if (baseVersion != currentVersion) {
-                    c.rollback();
+                    if (!deleted) {
+                        saveConflict(c, id, workspaceId, path, baseVersion, currentVersion, checksum,
+                                payload, userId, deviceName);
+                    }
+                    c.commit();
                     return row(
                             "conflict", true,
                             "id", id,
                             "current_version", currentVersion,
-                            "current_checksum", existing.getOrDefault("checksum", ""),
-                            "current_deleted", existing.getOrDefault("deleted", "false"),
+                            "current_checksum", currentChecksum,
+                            "current_deleted", currentDeleted,
                             "current_size", existing.getOrDefault("size", "0")
                     );
                 }
@@ -420,6 +482,8 @@ public class Database implements AutoCloseable {
                     ps.setLong(6, id);
                     ps.executeUpdate();
                 }
+                insertFileVersion(c, id, version, baseVersion, checksum, deleted, payload, userId,
+                        deviceName, deleted ? "DELETE" : "UPDATE", null);
             }
 
             c.commit();
@@ -436,9 +500,190 @@ public class Database implements AutoCloseable {
         } catch (SQLException e) {
             try { c.rollback(); } catch (SQLException ignored) { }
             throw e;
+        } catch (Exception e) {
+            try { c.rollback(); } catch (SQLException ignored) { }
+            throw e;
         } finally {
             try { c.setAutoCommit(true); } catch (SQLException ignored) { }
             pool.release(c);
+        }
+    }
+
+    public List<Map<String, String>> listFileVersions(long fileId) throws SQLException {
+        return query("""
+            SELECT v.version,v.base_version,v.checksum,v.is_deleted,v.source_device,v.operation,
+                   v.rollback_from_version,v.created_at,COALESCE(u.username,'') source_user
+            FROM file_versions v LEFT JOIN users u ON u.id=v.source_user_id
+            WHERE v.file_id=? ORDER BY v.version DESC
+            """, fileId);
+    }
+
+    public boolean copyFileVersion(long fileId, long version, Path destination) throws Exception {
+        Connection c = pool.borrow();
+        try (PreparedStatement ps = c.prepareStatement(
+                "SELECT checksum,is_deleted,content FROM file_versions WHERE file_id=? AND version=?")) {
+            ps.setLong(1, fileId);
+            ps.setLong(2, version);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (!rs.next() || rs.getBoolean("is_deleted")) return false;
+                String checksum = rs.getString("checksum");
+                InputStream content = rs.getBinaryStream("content");
+                if (content == null) return false;
+                try (InputStream in = content;
+                     OutputStream out = Files.newOutputStream(destination)) {
+                    in.transferTo(out);
+                }
+                if (!HashUtil.sha256(destination).equals(checksum)) {
+                    throw new SQLException("Stored version checksum does not match its content");
+                }
+                return true;
+            }
+        } finally {
+            pool.release(c);
+        }
+    }
+
+    public Map<String, String> rollbackFile(long workspaceId, String path, long targetVersion,
+                                            long expectedCurrentVersion, long userId, String deviceName)
+            throws Exception {
+        Connection c = pool.borrow();
+        Path restoredContent = null;
+        boolean committed = false;
+        try {
+            c.setAutoCommit(false);
+            Map<String, String> current = queryOne(c,
+                    "SELECT id,size,checksum,version,deleted FROM files WHERE workspace_id=? AND relative_path=? FOR UPDATE",
+                    workspaceId, path);
+            if (current == null) throw new IllegalArgumentException("File not found");
+
+            long currentVersion = Long.parseLong(current.get("version"));
+            long fileId = Long.parseLong(current.get("id"));
+            if (currentVersion != expectedCurrentVersion) {
+                c.rollback();
+                return row("conflict", true, "current_version", currentVersion);
+            }
+
+            long nextVersion = currentVersion + 1;
+            String checksum;
+            boolean deleted;
+            long size = 0;
+            try (PreparedStatement ps = c.prepareStatement(
+                    "SELECT checksum,is_deleted,content FROM file_versions WHERE file_id=? AND version=?")) {
+                ps.setLong(1, fileId);
+                ps.setLong(2, targetVersion);
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (!rs.next()) throw new IllegalArgumentException("Version content is unavailable");
+                    checksum = rs.getString("checksum");
+                    deleted = rs.getBoolean("is_deleted");
+                    if (!deleted) {
+                        restoredContent = Files.createTempFile("pbl4sync-rollback-", ".tmp");
+                        try (InputStream in = rs.getBinaryStream("content");
+                             OutputStream out = Files.newOutputStream(restoredContent)) {
+                            if (in == null) throw new IllegalArgumentException("Version content is unavailable");
+                            in.transferTo(out);
+                        }
+                        size = Files.size(restoredContent);
+                        if (!HashUtil.sha256(restoredContent).equals(checksum)) {
+                            throw new SQLException("Stored version checksum does not match its content");
+                        }
+                    }
+                }
+            }
+
+            insertFileVersion(c, fileId, nextVersion, currentVersion, checksum, deleted, restoredContent,
+                    userId, deviceName, "ROLLBACK", targetVersion);
+            try (PreparedStatement ps = c.prepareStatement(
+                    "UPDATE files SET size=?,checksum=?,version=?,modified_by=?,modified_at=NOW(),deleted=? WHERE id=?")) {
+                ps.setLong(1, size);
+                ps.setString(2, checksum);
+                ps.setLong(3, nextVersion);
+                ps.setLong(4, userId);
+                ps.setBoolean(5, deleted);
+                ps.setLong(6, fileId);
+                ps.executeUpdate();
+            }
+            c.commit();
+            committed = true;
+            return row("conflict", false, "file_id", fileId, "workspace_id", workspaceId,
+                    "relative_path", path, "version", nextVersion, "base_version", currentVersion,
+                    "rollback_from_version", targetVersion, "checksum", checksum, "size", size,
+                    "deleted", deleted, "content_path", restoredContent == null ? "" : restoredContent);
+        } catch (SQLException | RuntimeException e) {
+            try { c.rollback(); } catch (SQLException ignored) { }
+            throw e;
+        } catch (Exception e) {
+            try { c.rollback(); } catch (SQLException ignored) { }
+            throw e;
+        } finally {
+            try { c.setAutoCommit(true); } catch (SQLException ignored) { }
+            pool.release(c);
+            if (!committed && restoredContent != null) Files.deleteIfExists(restoredContent);
+        }
+    }
+
+    private void insertFileVersion(Connection c, long fileId, long version, long baseVersion, String checksum,
+                                   boolean deleted, Path content, long userId, String deviceName,
+                                   String operation, Long rollbackFromVersion) throws Exception {
+        try (PreparedStatement ps = c.prepareStatement("""
+                INSERT INTO file_versions(file_id,version,base_version,checksum,is_deleted,content,
+                                          source_user_id,source_device,operation,rollback_from_version)
+                VALUES(?,?,?,?,?,?,?,?,?,?)
+                """)) {
+            ps.setLong(1, fileId);
+            ps.setLong(2, version);
+            ps.setLong(3, baseVersion);
+            ps.setString(4, checksum == null ? "" : checksum);
+            ps.setBoolean(5, deleted);
+            if (deleted) {
+                ps.setNull(6, Types.BLOB);
+            } else {
+                if (content == null || !Files.isRegularFile(content)) {
+                    throw new IllegalArgumentException("File content is required for a non-deleted version");
+                }
+                try (InputStream in = Files.newInputStream(content)) {
+                    ps.setBinaryStream(6, in, Files.size(content));
+                    ps.setLong(7, userId);
+                    ps.setString(8, deviceName == null ? "" : deviceName);
+                    ps.setString(9, operation);
+                    if (rollbackFromVersion == null) ps.setNull(10, Types.BIGINT);
+                    else ps.setLong(10, rollbackFromVersion);
+                    ps.executeUpdate();
+                    return;
+                }
+            }
+            ps.setLong(7, userId);
+            ps.setString(8, deviceName == null ? "" : deviceName);
+            ps.setString(9, operation);
+            if (rollbackFromVersion == null) ps.setNull(10, Types.BIGINT);
+            else ps.setLong(10, rollbackFromVersion);
+            ps.executeUpdate();
+        }
+    }
+
+    private void saveConflict(Connection c, Long fileId, long workspaceId, String path,
+                              long baseVersion, long currentVersion, String checksum, Path content,
+                              long userId, String deviceName) throws Exception {
+        if (content == null || !Files.isRegularFile(content)) {
+            throw new IllegalArgumentException("Conflicting file content is unavailable");
+        }
+        try (PreparedStatement ps = c.prepareStatement("""
+                INSERT INTO file_conflicts(file_id,workspace_id,relative_path,base_version,current_version,
+                                           checksum,content,source_user_id,source_device)
+                VALUES(?,?,?,?,?,?,?,?,?)
+                """)) {
+            if (fileId == null) ps.setNull(1, Types.BIGINT);
+            else ps.setLong(1, fileId);
+            ps.setLong(2, workspaceId);
+            ps.setString(3, path);
+            ps.setLong(4, baseVersion);
+            ps.setLong(5, currentVersion);
+            ps.setString(6, checksum);
+            try (InputStream in = Files.newInputStream(content)) {
+                ps.setBinaryStream(7, in, Files.size(content));
+                ps.setLong(8, userId);
+                ps.setString(9, deviceName == null ? "" : deviceName);
+                ps.executeUpdate();
+            }
         }
     }
 

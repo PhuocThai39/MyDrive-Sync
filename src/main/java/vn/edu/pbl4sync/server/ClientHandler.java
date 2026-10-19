@@ -1,7 +1,6 @@
 package vn.edu.pbl4sync.server;
 
 import vn.edu.pbl4sync.common.MessageTypes;
-import vn.edu.pbl4sync.common.Packet;
 import vn.edu.pbl4sync.common.ProtocolIO;
 import vn.edu.pbl4sync.common.ReceivedPacket;
 

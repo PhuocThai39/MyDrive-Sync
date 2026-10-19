@@ -78,6 +78,7 @@ public class WorkspacePanel extends JPanel {
         JButton delete = new JButton("Delete");
         JButton open = new JButton("Open Local Folder");
         JButton sync = new JButton("Sync Now");
+        JButton history = new JButton("Version History / Rollback");
         upload.addActionListener(e -> upload());
         copy.addActionListener(e -> saveCopy());
         delete.addActionListener(e -> deleteSelected());
@@ -86,11 +87,13 @@ public class WorkspacePanel extends JPanel {
             service.syncNow();
             return null;
         }, x -> loadSelected(), ex -> UiAsync.error(this, ex)));
+        history.addActionListener(e -> showVersionHistory());
         b.add(upload);
         b.add(copy);
         b.add(delete);
         b.add(open);
         b.add(sync);
+        b.add(history);
         p.add(b, BorderLayout.SOUTH);
         return p;
     }
@@ -211,12 +214,47 @@ public class WorkspacePanel extends JPanel {
             warn("No DELETE permission");
             return;
         }
+
         if (JOptionPane.showConfirmDialog(this, "Delete " + f.get("relative_path") + " for all workspace members?",
                 "Confirm", JOptionPane.YES_NO_OPTION) == JOptionPane.YES_OPTION)
             UiAsync.run(() -> {
                 service.deleteWorkspaceFile(w.id(), f.get("relative_path"));
                 return null;
             }, x -> loadSelected(), ex -> UiAsync.error(this, ex));
+    }
+
+    private void showVersionHistory() {
+        WorkspaceItem w = selected();
+        Map<String, String> file = selectedFile();
+        if (w == null || file == null) {
+            warn("Select a file first");
+            return;
+        }
+        if (!service.allowed(w.row(), "MODIFY")) {
+            warn("No MODIFY permission");
+            return;
+        }
+        String path = file.get("relative_path");
+        UiAsync.run(() -> service.listFileVersions(w.id(), path), rows -> {
+            if (rows.isEmpty()) {
+                warn("No stored version history is available for this file");
+                return;
+            }
+            VersionItem selectedVersion = (VersionItem) JOptionPane.showInputDialog(this,
+                    "Choose the version whose content should be restored:",
+                    "Version History - " + path, JOptionPane.QUESTION_MESSAGE, null,
+                    rows.stream().map(VersionItem::new).toArray(), null);
+            if (selectedVersion == null) return;
+            long targetVersion = Long.parseLong(selectedVersion.row().get("version"));
+            long currentVersion = Long.parseLong(file.get("version"));
+            if (JOptionPane.showConfirmDialog(this,
+                    "Restore v" + targetVersion + " as a new version? The current file will not be deleted from history.",
+                    "Confirm Rollback", JOptionPane.YES_NO_OPTION) != JOptionPane.YES_OPTION) return;
+            UiAsync.run(() -> {
+                service.rollbackFile(w.id(), path, targetVersion, currentVersion);
+                return null;
+            }, result -> loadSelected(), ex -> UiAsync.error(this, ex));
+        }, ex -> UiAsync.error(this, ex));
     }
 
     private void openFolder() {
@@ -362,6 +400,19 @@ public class WorkspacePanel extends JPanel {
         @Override
         public String toString() {
             return row.get("name") + "  [" + row.getOrDefault("workspace_role", "") + "]";
+        }
+    }
+
+    private record VersionItem(Map<String, String> row) {
+        @Override
+        public String toString() {
+            String action = row.getOrDefault("operation", "UPDATE");
+            String user = row.getOrDefault("source_user", "");
+            String time = row.getOrDefault("created_at", "");
+            String restored = row.getOrDefault("rollback_from_version", "");
+            return "v" + row.get("version") + " (base v" + row.get("base_version") + ") - "
+                    + action + (restored.isBlank() ? "" : " from v" + restored)
+                    + " - " + user + " - " + time;
         }
     }
 

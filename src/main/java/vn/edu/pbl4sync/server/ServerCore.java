@@ -8,7 +8,6 @@ import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.sql.SQLException;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
@@ -22,6 +21,7 @@ public class ServerCore implements AutoCloseable {
     private final ConnectionManager connections = new ConnectionManager();
     private final List<ServerLogListener> logListeners = new CopyOnWriteArrayList<>();
     private final Map<String, RelayTicket> relayTickets = new ConcurrentHashMap<>();
+    private final Object[] fileLocks = createFileLocks();
     private ExecutorService clientPool;
     private ExecutorService transferPool;
     private volatile boolean running;
@@ -83,6 +83,8 @@ public class ServerCore implements AutoCloseable {
             case FILE_EVENT -> fileEvent(session, received);
             case FILE_APPLIED -> fileApplied(session, p);
             case FILE_RELAY_UPLOAD -> relayUpload(session, received);
+            case FILE_VERSIONS_REQUEST -> listFileVersions(session, p);
+            case FILE_ROLLBACK_REQUEST -> rollbackFile(session, p);
             case SYNC_REPORT -> syncReport(session, p);
             default -> session.send(p.response(ERROR).with("message", "Unknown message type: " + p.type()));
         }
@@ -124,6 +126,56 @@ public class ServerCore implements AutoCloseable {
         long ws = p.getLong("workspaceId", 0);
         requireRead(s, ws);
         s.send(p.response(LIST_FILES_RESPONSE).with("rows", TableCodec.encode(db.listFiles(ws))));
+    }
+
+    private void listFileVersions(ClientSession s, Packet p) throws Exception {
+        long ws = p.getLong("workspaceId", 0);
+        requireRead(s, ws);
+        String path = sanitizeRelativePath(p.get("path"));
+        Map<String, String> file = db.findFile(ws, path);
+        if (file == null) throw new IllegalArgumentException("File not found");
+        s.send(p.response(FILE_VERSIONS_RESPONSE)
+                .with("rows", TableCodec.encode(db.listFileVersions(parseLong(file.get("id"), 0)))));
+    }
+
+    private void rollbackFile(ClientSession s, Packet p) throws Exception {
+        long ws = p.getLong("workspaceId", 0);
+        String path = sanitizeRelativePath(p.get("path"));
+        if (!db.hasPermission(s.userId(), s.isAdmin(), ws, "MODIFY")) {
+            throw new SecurityException("Permission denied: MODIFY");
+        }
+        Object lock = fileLocks[Math.floorMod(Objects.hash(ws, path), fileLocks.length)];
+        synchronized (lock) {
+            Map<String, String> result = db.rollbackFile(ws, path,
+                    p.getLong("targetVersion", -1), p.getLong("currentVersion", -1),
+                    s.userId(), s.deviceName());
+            if (truthy(result.get("conflict"))) {
+                s.send(p.response(FILE_ROLLBACK_RESULT).with("success", false).with("conflict", true)
+                        .with("currentVersion", result.get("current_version")));
+                return;
+            }
+
+            long fileId = parseLong(result.get("file_id"), 0);
+            long version = parseLong(result.get("version"), 0);
+            long restoredVersion = parseLong(result.get("rollback_from_version"), 0);
+            boolean deleted = truthy(result.get("deleted"));
+            db.logActivity(s.userId(), ws, "ROLLBACK",
+                    path + " restored v" + restoredVersion + " as v" + version);
+            s.send(p.response(FILE_ROLLBACK_RESULT).with("success", true).with("version", version)
+                    .with("restoredVersion", restoredVersion));
+
+            if (deleted) {
+                broadcastToWorkspace(ws, Packet.event(FILE_DELETE).with("workspaceId", ws)
+                        .with("path", path).with("fileId", fileId).with("version", version), null, 0);
+            } else {
+                Path content = Path.of(result.get("content_path"));
+                Packet deliver = Packet.event(FILE_DELIVER).with("workspaceId", ws).with("path", path)
+                        .with("fileId", fileId).with("version", version)
+                        .with("checksum", result.get("checksum")).with("size", result.get("size"))
+                        .with("conflict", false);
+                broadcastToWorkspace(ws, deliver, content, 0);
+            }
+        }
     }
 
     private void listMembers(ClientSession s, Packet p) throws Exception {
@@ -232,6 +284,14 @@ public class ServerCore implements AutoCloseable {
         long ws = p.getLong("workspaceId", 0);
         String action = p.get("action").toUpperCase(Locale.ROOT);
         String path = sanitizeRelativePath(p.get("path"));
+        Object lock = fileLocks[Math.floorMod(Objects.hash(ws, path), fileLocks.length)];
+        synchronized (lock) {
+            processFileEvent(s, received, p, ws, action, path);
+        }
+    }
+
+    private void processFileEvent(ClientSession s, ReceivedPacket received, Packet p,
+                                  long ws, String action, String path) throws Exception {
         Map<String, String> existingFile = db.findFile(ws, path);
         String permission;
         if ("DELETE".equals(action)) permission = "DELETE";
@@ -244,50 +304,121 @@ public class ServerCore implements AutoCloseable {
         boolean deleted = "DELETE".equals(action);
         long baseVersion = p.getLong("baseVersion", 0);
         Path cached = null;
-        long size = 0;
-        String checksum = "";
-        if (!deleted) {
-            if (received.payloadPath() == null) throw new IllegalArgumentException("File payload required");
-            size = Files.size(received.payloadPath());
-            checksum = HashUtil.sha256(received.payloadPath());
-            cached = Files.createTempFile("pbl4sync-relay-", ".tmp");
-            Files.copy(received.payloadPath(), cached, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
-        }
+        try {
+            long size = 0;
+            String checksum = "";
+            if (!deleted) {
+                if (received.payloadPath() == null) throw new IllegalArgumentException("File payload required");
+                size = Files.size(received.payloadPath());
+                checksum = HashUtil.sha256(received.payloadPath());
+                cached = Files.createTempFile("pbl4sync-relay-", ".tmp");
+                Files.copy(received.payloadPath(), cached, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+            }
 
-        Map<String, String> file = db.applyFileChange(ws, path, size, checksum, s.userId(), baseVersion, deleted);
-        if (truthy(file.get("conflict"))) {
+            Map<String, String> file = db.applyFileChange(ws, path, size, checksum, s.userId(), s.deviceName(),
+                    baseVersion, deleted, received.payloadPath());
+            if (truthy(file.get("conflict"))) {
+                s.send(p.response(FILE_EVENT_RESULT)
+                        .with("success", false)
+                        .with("conflict", true)
+                        .with("path", path)
+                        .with("workspaceId", ws)
+                        .with("baseVersion", baseVersion)
+                        .with("currentVersion", file.getOrDefault("current_version", "0"))
+                        .with("currentChecksum", file.getOrDefault("current_checksum", ""))
+                        .with("currentDeleted", file.getOrDefault("current_deleted", "false")));
+                return;
+            }
+
+            long fileId = Long.parseLong(file.get("id"));
+            long version = Long.parseLong(file.get("version"));
+            if (!deleted) db.markReplica(fileId, s.agentId(), version, checksum);
+            db.logActivity(s.userId(), ws, action, path + " v" + version);
+
+            Packet result = p.response(FILE_EVENT_RESULT).with("success", true).with("fileId", fileId)
+                    .with("version", version).with("checksum", checksum).with("size", size)
+                    .with("path", path).with("workspaceId", ws);
+            s.send(result);
+
+            if (!truthy(file.get("unchanged"))) {
+                if (!deleted) {
+                    broadcastBackupVersion(ws, path, fileId, version, checksum);
+                }
+                broadcastPriorVersionBackup(ws, path, existingFile);
+            }
+
+            if (deleted) {
+                Packet del = Packet.event(FILE_DELETE).with("workspaceId", ws).with("path", path)
+                        .with("fileId", fileId).with("version", version);
+                broadcastToWorkspace(ws, del, null, s.agentId());
+            } else {
+                Packet deliver = Packet.event(FILE_DELIVER).with("workspaceId", ws).with("path", path)
+                        .with("fileId", fileId).with("version", version).with("checksum", checksum)
+                        .with("size", size).with("conflict", false);
+                broadcastToWorkspace(ws, deliver, cached, s.agentId());
+                cached = null;
+            }
+        } finally {
             if (cached != null) Files.deleteIfExists(cached);
-            s.send(p.response(FILE_EVENT_RESULT)
-                    .with("success", false)
-                    .with("conflict", true)
-                    .with("path", path)
-                    .with("workspaceId", ws)
-                    .with("baseVersion", baseVersion)
-                    .with("currentVersion", file.getOrDefault("current_version", "0"))
-                    .with("currentChecksum", file.getOrDefault("current_checksum", ""))
-                    .with("currentDeleted", file.getOrDefault("current_deleted", "false")));
+        }
+    }
+
+    private void broadcastPriorVersionBackup(long workspaceId, String path,
+                                             Map<String, String> previousFile) {
+        if (previousFile == null || truthy(previousFile.get("deleted")))
             return;
+
+        long fileId = parseLong(previousFile.get("id"), 0);
+        long version = parseLong(previousFile.get("version"), 0);
+        broadcastBackupVersion(workspaceId, path, fileId, version,
+                previousFile.getOrDefault("checksum", ""));
+    }
+
+    private void broadcastBackupVersion(long workspaceId, String path, long fileId,
+                                        long version, String checksum) {
+        Path payload = null;
+        boolean transferred = false;
+        try {
+            payload = Files.createTempFile("pbl4sync-backup-", ".tmp");
+            if (!db.copyFileVersion(fileId, version, payload)) {
+                String message = "Backup unavailable for " + path + " v" + version
+                        + ": stored content is missing";
+                log(message);
+                broadcastToWorkspace(workspaceId,
+                        Packet.event(NOTIFICATION).with("level", "WARN")
+                                .with("message", "Could not back up previous version of " + path
+                                        + " because its stored content is unavailable"),
+                        null, 0);
+                return;
+            }
+
+            Packet backup = Packet.event(FILE_BACKUP)
+                    .with("workspaceId", workspaceId)
+                    .with("path", path)
+                    .with("version", version)
+                    .with("checksum", checksum);
+            broadcastToWorkspace(workspaceId, backup, payload, 0);
+            transferred = true;
+        } catch (Exception e) {
+            String message = "Could not distribute backup for " + path + " v" + version
+                    + ": " + e.getMessage();
+            log(message);
+            try {
+                broadcastToWorkspace(workspaceId,
+                        Packet.event(NOTIFICATION).with("level", "WARN").with("message", message),
+                        null, 0);
+            } catch (Exception notificationError) {
+                log("Could not notify workspace about backup failure: " + notificationError.getMessage());
+            }
+        } finally {
+            if (!transferred && payload != null) {
+                try {
+                    Files.deleteIfExists(payload);
+                } catch (Exception cleanupError) {
+                    log("Could not remove temporary backup payload: " + cleanupError.getMessage());
+                }
+            }
         }
-
-        long fileId = Long.parseLong(file.get("id"));
-        long version = Long.parseLong(file.get("version"));
-        if (!deleted) db.markReplica(fileId, s.agentId(), version, checksum);
-        db.logActivity(s.userId(), ws, action, path + " v" + version);
-
-        Packet result = p.response(FILE_EVENT_RESULT).with("success", true).with("fileId", fileId).with("version", version)
-                .with("checksum", checksum).with("size", size).with("path", path).with("workspaceId", ws);
-        s.send(result);
-
-        if (deleted) {
-            Packet del = Packet.event(FILE_DELETE).with("workspaceId", ws).with("path", path).with("fileId", fileId).with("version", version);
-            broadcastToWorkspace(ws, del, null, s.agentId());
-        } else {
-            Packet deliver = Packet.event(FILE_DELIVER).with("workspaceId", ws).with("path", path).with("fileId", fileId)
-                    .with("version", version).with("checksum", checksum).with("size", size).with("conflict", false);
-            broadcastToWorkspace(ws, deliver, cached, s.agentId());
-            cached = null;
-        }
-        if (cached != null) Files.deleteIfExists(cached);
     }
 
     private void fileApplied(ClientSession s, Packet p) throws Exception {
@@ -328,12 +459,21 @@ public class ServerCore implements AutoCloseable {
 
     private void syncReport(ClientSession s, Packet p) throws Exception {
         List<Map<String, String>> localRows = TableCodec.decode(p.get("rows"));
+        List<Map<String, String>> localBackups = TableCodec.decode(p.get("backups"));
         Map<String, Map<String, String>> local = new HashMap<>();
         for (Map<String, String> r : localRows) {
             long ws = parseLong(r.get("workspace_id"), 0);
             if (!s.isAdmin() && !db.isMember(s.userId(), ws)) continue;
             String path = sanitizeRelativePath(r.getOrDefault("path", ""));
             local.put(ws + "|" + path, r);
+        }
+        Set<String> knownBackups = new HashSet<>();
+        for (Map<String, String> backup : localBackups) {
+            long ws = parseLong(backup.get("workspace_id"), 0);
+            if (!s.isAdmin() && !db.isMember(s.userId(), ws)) continue;
+            String path = sanitizeRelativePath(backup.getOrDefault("path", ""));
+            long version = parseLong(backup.get("version"), 0);
+            knownBackups.add(ws + "|" + path + "|" + version);
         }
 
         List<Map<String, String>> serverFiles = db.filesForUser(s.userId(), s.isAdmin());
@@ -345,6 +485,8 @@ public class ServerCore implements AutoCloseable {
             String path = f.get("relative_path");
             String key = ws + "|" + path;
             knownServerKeys.add(key);
+            int missingBackups = sendMissingBackups(s, f, knownBackups);
+            actions += missingBackups;
             Map<String, String> l = local.get(key);
             boolean deleted = truthy(f.get("deleted"));
             long serverVersion = parseLong(f.get("version"), 0);
@@ -364,6 +506,12 @@ public class ServerCore implements AutoCloseable {
 
             String localChecksum = l.getOrDefault("checksum", "");
             long knownVersion = parseLong(l.get("known_version"), 0);
+            if (truthy(l.get("conflicted"))) {
+                s.send(Packet.event(CONFLICT_NOTICE).with("workspaceId", ws).with("path", path)
+                        .with("message", "Local content is preserved as a conflict; refusing automatic upload"));
+                if (requestCurrentReplica(s, f, true)) actions++;
+                continue;
+            }
             if (Objects.equals(localChecksum, f.getOrDefault("checksum", ""))) {
                 db.markReplica(parseLong(f.get("id"), 0), s.agentId(), serverVersion, localChecksum);
                 s.send(Packet.event(SYNC_STATE).with("workspaceId", ws).with("path", path).with("version", serverVersion).with("checksum", localChecksum));
@@ -406,6 +554,39 @@ public class ServerCore implements AutoCloseable {
         s.send(p.response(SYNC_REPORT_RESULT).with("success", true).with("actions", actions));
     }
 
+    private int sendMissingBackups(ClientSession target, Map<String, String> file,
+                                   Set<String> knownBackups) throws Exception {
+        long workspaceId = parseLong(file.get("workspace_id"), 0);
+        long fileId = parseLong(file.get("id"), 0);
+        String path = file.get("relative_path");
+        int actions = 0;
+        for (Map<String, String> version : db.listFileVersions(fileId)) {
+            if (truthy(version.get("is_deleted"))) continue;
+            long versionNumber = parseLong(version.get("version"), 0);
+            if (!knownBackups.add(workspaceId + "|" + path + "|" + versionNumber)) continue;
+
+            Path payload = Files.createTempFile("pbl4sync-backup-sync-", ".tmp");
+            try {
+                if (!db.copyFileVersion(fileId, versionNumber, payload)) {
+                    log("Backup unavailable for " + path + " v" + versionNumber
+                            + ": stored content is missing");
+                    continue;
+                }
+                Packet backup = Packet.event(FILE_BACKUP)
+                        .with("workspaceId", workspaceId)
+                        .with("path", path)
+                        .with("version", versionNumber)
+                        .with("checksum", version.getOrDefault("checksum", ""));
+                sendAndDelete(target, backup, payload);
+                payload = null;
+                actions++;
+            } finally {
+                if (payload != null) Files.deleteIfExists(payload);
+            }
+        }
+        return actions;
+    }
+
     private boolean requestCurrentReplica(ClientSession target, Map<String, String> file, boolean conflict) throws Exception {
         long fileId = parseLong(file.get("id"), 0);
         long version = parseLong(file.get("version"), 0);
@@ -426,6 +607,23 @@ public class ServerCore implements AutoCloseable {
                     .with("conflict", conflict);
             source.send(fetch);
             return true;
+        }
+        Path storedVersion = Files.createTempFile("pbl4sync-version-", ".tmp");
+        try {
+            if (db.copyFileVersion(fileId, version, storedVersion)) {
+                Packet deliver = Packet.event(FILE_DELIVER)
+                        .with("workspaceId", file.get("workspace_id"))
+                        .with("path", file.get("relative_path"))
+                        .with("fileId", fileId)
+                        .with("version", version)
+                        .with("checksum", file.get("checksum"))
+                        .with("size", file.get("size"))
+                        .with("conflict", conflict);
+                target.send(deliver, storedVersion);
+                return true;
+            }
+        } finally {
+            Files.deleteIfExists(storedVersion);
         }
         target.send(Packet.event(NOTIFICATION).with("level", "WARN").with("message",
                 "Cannot sync " + file.get("relative_path") + ": no online Agent currently holds version " + version));
@@ -475,6 +673,12 @@ public class ServerCore implements AutoCloseable {
 
     private void notifyWorkspace(long ws, String message, long excludeAgent) throws Exception {
         broadcastToWorkspace(ws, Packet.event(NOTIFICATION).with("level", "INFO").with("message", message), null, excludeAgent);
+    }
+
+    private static Object[] createFileLocks() {
+        Object[] locks = new Object[128];
+        Arrays.setAll(locks, ignored -> new Object());
+        return locks;
     }
 
     private void requireAdmin(ClientSession s) { if (!s.isAdmin()) throw new SecurityException("Admin only"); }
