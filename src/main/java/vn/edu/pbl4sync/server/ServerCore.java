@@ -6,6 +6,8 @@ import vn.edu.pbl4sync.server.db.Database;
 import java.io.IOException;
 import java.net.ServerSocket;
 import java.net.Socket;
+import javax.net.ssl.SSLServerSocket;
+import javax.net.ssl.SSLSocket;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.sql.SQLException;
@@ -32,10 +34,15 @@ public class ServerCore implements AutoCloseable {
 
     public synchronized void start() throws Exception {
         if (running) return;
-        db = new Database(config.dbUrl(), config.dbUser(), config.dbPassword(), config.dbPoolSize(), config.initialAdminPassword());
+        var tlsContext = TlsSupport.serverContext();
+        db = new Database(config.dbUrl(), config.dbUser(), config.dbPassword(), config.dbPoolSize(),
+                config.dbConnectionProperties(), config.initialAdminPassword());
         clientPool = Executors.newFixedThreadPool(config.clientThreads());
         transferPool = Executors.newFixedThreadPool(config.transferThreads());
-        serverSocket = new ServerSocket(config.port());
+        SSLServerSocket tlsServerSocket = (SSLServerSocket) tlsContext.getServerSocketFactory()
+                .createServerSocket(config.port());
+        TlsSupport.configureServerSocket(tlsServerSocket);
+        serverSocket = tlsServerSocket;
         running = true;
         log("Server started on port " + config.port());
         Thread acceptThread = new Thread(this::acceptLoop, "server-accept");
@@ -46,7 +53,12 @@ public class ServerCore implements AutoCloseable {
     private void acceptLoop() {
         while (running) {
             try {
-                Socket socket = serverSocket.accept();
+                Socket accepted = serverSocket.accept();
+                if (!(accepted instanceof SSLSocket socket)) {
+                    accepted.close();
+                    throw new IOException("Non-TLS client connection rejected");
+                }
+                TlsSupport.configureServerSocket(socket);
                 socket.setKeepAlive(true);
                 socket.setTcpNoDelay(true);
                 clientPool.submit(new ClientHandler(this, socket));

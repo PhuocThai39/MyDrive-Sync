@@ -9,9 +9,10 @@ import java.util.*;
 public class Database implements AutoCloseable {
     private final SimpleConnectionPool pool;
 
-    public Database(String url, String user, String password, int poolSize, String initialAdminPassword) throws Exception {
+    public Database(String url, String user, String password, int poolSize, Properties connectionProperties,
+                    String initialAdminPassword) throws Exception {
         Class.forName("com.mysql.cj.jdbc.Driver");
-        this.pool = new SimpleConnectionPool(url, user, password, poolSize);
+        this.pool = new SimpleConnectionPool(url, user, password, poolSize, connectionProperties);
         initializeSchema();
         markAllAgentsOffline();
         seedAdmin(initialAdminPassword);
