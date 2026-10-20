@@ -9,7 +9,6 @@ import java.awt.event.WindowAdapter;
 import java.awt.event.WindowEvent;
 import java.util.LinkedHashMap;
 import java.util.Map;
-import java.util.Objects;
 
 public class MainFrame extends JFrame {
     private final AgentService service;

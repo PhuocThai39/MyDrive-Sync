@@ -8,6 +8,9 @@ public final class SyncFileFilter {
 
     public static boolean shouldIgnore(Path path) {
     if (path == null || path.getFileName() == null) return true;
+    for (Path part : path) {
+        if ("BackUp".equalsIgnoreCase(part.toString())) return true;
+    }
 
     String name = path.getFileName().toString();
 

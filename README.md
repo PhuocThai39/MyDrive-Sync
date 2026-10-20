@@ -324,7 +324,7 @@ Agent
 
 Activity Log
 
-File thật được lưu tại các Agent; Server chủ yếu quản lý metadata và điều phối đồng bộ.
+Các Agent giữ bản làm việc; Server quản lý metadata, điều phối đồng bộ và lưu nội dung lịch sử version để backup/rollback.
 
 11. Workflow Git đề xuất cho nhóm
 
@@ -463,3 +463,13 @@ Sau đó:
 4. Run PBL4 Agent
 5. Agent nhập IP Server : 5000
 6. Login và test
+
+15. Version history, backup và rollback
+
+Server kiểm tra `baseVersion` trong transaction có khóa hàng trước khi chấp nhận nội dung. Cập nhật đúng phiên bản tạo một version mới; cập nhật dựa trên version cũ bị từ chối và nội dung gửi lên được lưu riêng trong `file_conflicts`, không thay nội dung hiện hành.
+
+Nội dung các version mới được lưu trong bảng `file_versions` dưới dạng `LONGBLOB`, kèm base version, checksum, thời gian, người/thiết bị cập nhật và thông tin rollback. Từ màn hình **Workspaces > Files**, chọn file và bấm **Version History / Rollback** để chọn bất kỳ version còn trong lịch sử. Rollback kiểm tra version hiện tại trong transaction và tạo version mới; không giảm số version. Sau khi rollback, Server phát nội dung qua luồng `FILE_DELIVER`/`FILE_DELETE` hiện có.
+
+Mỗi phiên bản file được Server chấp nhận sẽ được gửi tới các Agent đang kết nối để lưu trong `CompanySync\BackUp\<workspace-id>_<workspace>\<đường-dẫn-file>`. Khi một Agent kết nối lại hoặc chạy đồng bộ, Server cũng gửi các version lịch sử mà Agent chưa có. Thư mục `BackUp` không được đưa vào đồng bộ thông thường và không tự xóa các bản backup; cần dự trù dung lượng ổ đĩa và DB.
+
+Khi phát hiện conflict, bản sửa xung đột được lưu riêng dưới `CompanySync\.pbl4sync\conflicts\<workspace-id>` và không được đưa vào `BackUp`; phiên bản hiện hành từ Server tiếp tục được đồng bộ. Agent phải chủ động hợp nhất hoặc khôi phục nội dung cần dùng. Nội dung các version cũ trước khi cập nhật phần mềm có thể chưa có payload trong DB.
