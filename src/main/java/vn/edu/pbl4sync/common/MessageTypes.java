@@ -33,6 +33,7 @@ public final class MessageTypes {
     public static final String DELETE_WORKSPACE_REQUEST = "DELETE_WORKSPACE_REQUEST";
 
     public static final String FILE_EVENT = "FILE_EVENT";
+    public static final String FILE_BACKUP = "FILE_BACKUP";
     public static final String FILE_DELIVER = "FILE_DELIVER";
     public static final String FILE_DELETE = "FILE_DELETE";
     public static final String FILE_APPLIED = "FILE_APPLIED";
@@ -40,6 +41,10 @@ public final class MessageTypes {
     public static final String FILE_FETCH_REQUEST = "FILE_FETCH_REQUEST";
     public static final String FILE_UPLOAD_REQUEST = "FILE_UPLOAD_REQUEST";
     public static final String FILE_EVENT_RESULT = "FILE_EVENT_RESULT";
+    public static final String FILE_VERSIONS_REQUEST = "FILE_VERSIONS_REQUEST";
+    public static final String FILE_VERSIONS_RESPONSE = "FILE_VERSIONS_RESPONSE";
+    public static final String FILE_ROLLBACK_REQUEST = "FILE_ROLLBACK_REQUEST";
+    public static final String FILE_ROLLBACK_RESULT = "FILE_ROLLBACK_RESULT";
 
     public static final String SYNC_REPORT = "SYNC_REPORT";
     public static final String SYNC_REPORT_RESULT = "SYNC_REPORT_RESULT";

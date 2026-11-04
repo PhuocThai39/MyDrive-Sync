@@ -3,24 +3,17 @@
   "configurations": [
     {
       "type": "java",
-      "name": "LoadTestMain",
-      "request": "launch",
-      "mainClass": "vn.edu.pbl4sync.tools.LoadTestMain",
-      "projectName": "pbl4-company-sync"
-    },
-    {
-      "type": "java",
-      "name": "Run PBL4 Server",
+      "name": "Run Server",
       "request": "launch",
       "mainClass": "vn.edu.pbl4sync.server.ServerMain",
-      "cwd": "${workspaceFolder}"
+      "projectName": "MyDrive-Sync"
     },
     {
       "type": "java",
-      "name": "Run PBL4 Agent",
+      "name": "Run Client",
       "request": "launch",
       "mainClass": "vn.edu.pbl4sync.client.ClientMain",
-      "cwd": "${workspaceFolder}"
+      "projectName": "MyDrive-Sync"
     }
   ]
 }

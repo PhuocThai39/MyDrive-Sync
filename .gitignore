@@ -5,3 +5,4 @@
 *.iml
 CompanySync/
 .pbl4sync-state.properties
+/certs/

@@ -70,6 +70,42 @@ CREATE TABLE IF NOT EXISTS file_replicas (
   FOREIGN KEY(agent_id) REFERENCES agents(id) ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS file_versions (
+  id BIGINT PRIMARY KEY AUTO_INCREMENT,
+  file_id BIGINT NOT NULL,
+  version BIGINT NOT NULL,
+  base_version BIGINT NOT NULL,
+  checksum VARCHAR(128),
+  is_deleted BOOLEAN NOT NULL DEFAULT FALSE,
+  content LONGBLOB,
+  source_user_id BIGINT,
+  source_device VARCHAR(180) NOT NULL DEFAULT '',
+  operation VARCHAR(30) NOT NULL,
+  rollback_from_version BIGINT,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE KEY uq_file_version(file_id,version),
+  FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE,
+  FOREIGN KEY(source_user_id) REFERENCES users(id) ON DELETE SET NULL
+);
+
+CREATE TABLE IF NOT EXISTS file_conflicts (
+  id BIGINT PRIMARY KEY AUTO_INCREMENT,
+  file_id BIGINT NULL,
+  workspace_id BIGINT NOT NULL,
+  relative_path VARCHAR(700) NOT NULL,
+  base_version BIGINT NOT NULL,
+  current_version BIGINT NOT NULL,
+  checksum VARCHAR(128) NOT NULL,
+  content LONGBLOB NOT NULL,
+  source_user_id BIGINT,
+  source_device VARCHAR(180) NOT NULL DEFAULT '',
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  INDEX idx_file_conflicts(file_id,created_at),
+  FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE SET NULL,
+  FOREIGN KEY(workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE,
+  FOREIGN KEY(source_user_id) REFERENCES users(id) ON DELETE SET NULL
+);
+
 CREATE TABLE IF NOT EXISTS activities (
   id BIGINT PRIMARY KEY AUTO_INCREMENT,
   user_id BIGINT,
