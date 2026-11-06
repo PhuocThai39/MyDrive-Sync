@@ -5,25 +5,18 @@ import org.junit.jupiter.api.io.TempDir;
 import vn.edu.pbl4sync.client.sync.LocalStateStore;
 import vn.edu.pbl4sync.common.HashUtil;
 import vn.edu.pbl4sync.common.Packet;
-import vn.edu.pbl4sync.common.ProtocolIO;
 
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
-import java.net.ServerSocket;
-import java.net.Socket;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
-import static vn.edu.pbl4sync.common.MessageTypes.FILE_APPLIED;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static vn.edu.pbl4sync.common.MessageTypes.FILE_DELIVER;
-import static vn.edu.pbl4sync.common.MessageTypes.FILE_EVENT_RESULT;
-import static vn.edu.pbl4sync.common.MessageTypes.SYNC_REPORT_RESULT;
 
 class AgentServiceConflictResolutionTest {
     @TempDir
@@ -35,8 +28,7 @@ class AgentServiceConflictResolutionTest {
         ClientConfig config = new ClientConfig(temp.resolve("client.properties"));
         config.setSyncRoot(syncRoot);
 
-        try (ServerSocket server = new ServerSocket(0);
-             AgentService service = new AgentService(config)) {
+        try (AgentService service = new AgentService(config)) {
             Path localFile = syncRoot.resolve("7_bin").resolve("bintest.txt");
             Files.createDirectories(localFile.getParent());
             Files.writeString(localFile, "second device version");
@@ -48,37 +40,31 @@ class AgentServiceConflictResolutionTest {
             setField(service, "workspaces", List.of(Map.of("id", "7", "name", "bin")));
 
             String conflictPath = "bintest_conflict_LaptopA_20261106_100513.txt";
-            CompletableFuture<Packet> applied = CompletableFuture.supplyAsync(() -> {
-                try (Socket socket = server.accept();
-                     var upload = ProtocolIO.receive(socket.getInputStream())) {
-                    ProtocolIO.send(socket.getOutputStream(), upload.packet().response(FILE_EVENT_RESULT)
-                            .with("conflict", true)
-                            .with("conflictPath", conflictPath)
-                            .with("currentVersion", 2), null);
-                    try (var sync = ProtocolIO.receive(socket.getInputStream())) {
-                        ProtocolIO.send(socket.getOutputStream(),
-                                sync.packet().response(SYNC_REPORT_RESULT)
-                                        .with("success", true).with("actions", 0), null);
-                    }
-                    try (var ack = ProtocolIO.receive(socket.getInputStream())) {
-                        return ack.packet();
-                    }
-                } catch (Exception e) {
-                    throw new IllegalStateException(e);
-                }
-            });
-
-            NetworkClient network = (NetworkClient) getField(service, "network");
-            network.connect("127.0.0.1", server.getLocalPort());
-
-            Method upload = AgentService.class.getDeclaredMethod(
-                    "uploadLocalChange", long.class, String.class, String.class);
-            upload.setAccessible(true);
-            upload.invoke(service, 7L, "bintest.txt", "MODIFY");
+            Method moveConflict = AgentService.class.getDeclaredMethod(
+                    "moveUploadedConflict", long.class, String.class, String.class, long.class);
+            moveConflict.setAccessible(true);
+            moveConflict.invoke(service, 7L, "bintest.txt", conflictPath, 1L);
 
             Path conflictFile = localFile.resolveSibling(conflictPath);
             assertFalse(Files.exists(localFile));
             assertEquals("second device version", Files.readString(conflictFile));
+            assertEquals(1, state.version(7, conflictPath));
+            assertEquals(localChecksum, state.checksum(7, conflictPath));
+
+            Path conflictPayload = temp.resolve("server-conflict-copy.txt");
+            Files.writeString(conflictPayload, "second device version");
+            Files.writeString(conflictFile, "newer local edit");
+            Packet conflictDelivery = Packet.event(FILE_DELIVER)
+                    .with("workspaceId", 7)
+                    .with("path", conflictPath)
+                    .with("version", 1)
+                    .with("checksum", localChecksum)
+                    .with("conflictCopy", true)
+                    .with("originalPath", "bintest.txt");
+            Method apply = AgentService.class.getDeclaredMethod("applyDeliveredFile", Packet.class, Path.class);
+            apply.setAccessible(true);
+            apply.invoke(service, conflictDelivery, conflictPayload);
+            assertEquals("newer local edit", Files.readString(conflictFile));
 
             Path winner = temp.resolve("winner.txt");
             Files.writeString(winner, "server winning version");
@@ -87,14 +73,13 @@ class AgentServiceConflictResolutionTest {
                     .with("path", "bintest.txt")
                     .with("version", 2)
                     .with("checksum", HashUtil.sha256(winner))
+                    .with("authoritative", true)
                     .with("fileId", 11);
-            Method apply = AgentService.class.getDeclaredMethod("applyDeliveredFile", Packet.class, Path.class);
-            apply.setAccessible(true);
-            apply.invoke(service, delivery, winner);
+            assertThrows(java.lang.reflect.InvocationTargetException.class,
+                    () -> apply.invoke(service, delivery, winner));
 
-            assertEquals(FILE_APPLIED, applied.get(5, TimeUnit.SECONDS).type());
             assertEquals("server winning version", Files.readString(localFile));
-            assertEquals("second device version", Files.readString(conflictFile));
+            assertEquals("newer local edit", Files.readString(conflictFile));
             assertEquals(2, state.version(7, "bintest.txt"));
             assertEquals(HashUtil.sha256(winner), state.checksum(7, "bintest.txt"));
         }
@@ -120,18 +105,27 @@ class AgentServiceConflictResolutionTest {
             setField(service, "state", state);
             setField(service, "workspaces", List.of(Map.of("id", "7", "name", "bin")));
 
+            Method apply = AgentService.class.getDeclaredMethod("applyDeliveredFile", Packet.class, Path.class);
+            apply.setAccessible(true);
+            Packet invalidDelivery = Packet.event(FILE_DELIVER)
+                    .with("workspaceId", 7)
+                    .with("path", "bintest.txt")
+                    .with("checksum", checksum)
+                    .with("conflictCopy", true)
+                    .with("originalPath", "bintest.txt");
+            assertThrows(java.lang.reflect.InvocationTargetException.class,
+                    () -> apply.invoke(service, invalidDelivery, incoming));
+            assertEquals("server winning version", Files.readString(original));
+
             String conflictPath = "bintest_conflict_LaptopA_20261106_100513.txt";
             Packet delivery = Packet.event(FILE_DELIVER)
                     .with("workspaceId", 7)
                     .with("path", conflictPath)
                     .with("version", 1)
                     .with("checksum", checksum)
-                    .with("conflict", true)
                     .with("conflictCopy", true)
                     .with("originalPath", "bintest.txt")
                     .with("conflictDevice", "LaptopA");
-            Method apply = AgentService.class.getDeclaredMethod("applyDeliveredFile", Packet.class, Path.class);
-            apply.setAccessible(true);
             apply.invoke(service, delivery, incoming);
 
             assertEquals("server winning version", Files.readString(original));
@@ -146,11 +140,5 @@ class AgentServiceConflictResolutionTest {
         Field field = target.getClass().getDeclaredField(name);
         field.setAccessible(true);
         field.set(target, value);
-    }
-
-    private static Object getField(Object target, String name) throws Exception {
-        Field field = target.getClass().getDeclaredField(name);
-        field.setAccessible(true);
-        return field.get(target);
     }
 }

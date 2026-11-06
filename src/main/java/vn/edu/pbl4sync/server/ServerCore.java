@@ -346,6 +346,8 @@ public class ServerCore implements AutoCloseable {
                         .with("conflict", true)
                         .with("path", path)
                         .with("conflictPath", conflictPath)
+                        .with("conflictVersion", conflictVersion)
+                        .with("conflictChecksum", conflictChecksum)
                         .with("workspaceId", ws)
                         .with("baseVersion", baseVersion)
                         .with("currentVersion", file.getOrDefault("current_version", "0"))
@@ -503,7 +505,7 @@ public class ServerCore implements AutoCloseable {
                 .with("workspaceId", ws).with("path", sanitizeRelativePath(p.get("path")))
                 .with("fileId", p.get("fileId")).with("version", p.get("version"))
                 .with("checksum", p.get("checksum")).with("size", Files.size(cached))
-                .with("conflict", p.getBoolean("conflict", false))
+                .with("authoritative", p.getBoolean("authoritative", p.getBoolean("conflict", false)))
                 .with("conflictCopy", p.getBoolean("conflictCopy", false))
                 .with("originalPath", p.get("originalPath"))
                 .with("conflictDevice", p.get("conflictDevice"));
@@ -640,7 +642,7 @@ public class ServerCore implements AutoCloseable {
         return actions;
     }
 
-    private boolean requestCurrentReplica(ClientSession target, Map<String, String> file, boolean conflict) throws Exception {
+    private boolean requestCurrentReplica(ClientSession target, Map<String, String> file, boolean authoritative) throws Exception {
         long fileId = parseLong(file.get("id"), 0);
         long version = parseLong(file.get("version"), 0);
         for (Long agentId : db.replicaAgents(fileId, version)) {
@@ -657,7 +659,7 @@ public class ServerCore implements AutoCloseable {
                     .with("version", version)
                     .with("checksum", file.get("checksum"))
                     .with("size", file.get("size"))
-                    .with("conflict", conflict);
+                    .with("authoritative", authoritative);
             source.send(fetch);
             return true;
         }
@@ -671,7 +673,7 @@ public class ServerCore implements AutoCloseable {
                         .with("version", version)
                         .with("checksum", file.get("checksum"))
                         .with("size", file.get("size"))
-                        .with("conflict", conflict);
+                        .with("authoritative", authoritative);
                 target.send(deliver, storedVersion);
                 return true;
             }

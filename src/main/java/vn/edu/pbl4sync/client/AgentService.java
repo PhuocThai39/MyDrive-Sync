@@ -266,19 +266,7 @@ public class AgentService implements AutoCloseable {
             if (conflictPath.isBlank())
                 throw new IllegalStateException("Server reported a conflict without a conflict-copy path");
 
-            Path localFile = safeResolve(workspaceDir(workspace), path);
-            if (Files.isRegularFile(localFile)) {
-                Path conflictFile = safeResolve(workspaceDir(workspace), conflictPath);
-                Files.createDirectories(conflictFile.getParent());
-                ignore.ignore(localFile, 3000);
-                ignore.ignore(conflictFile, 3000);
-                try {
-                    Files.move(localFile, conflictFile,
-                            StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
-                } catch (AtomicMoveNotSupportedException e) {
-                    Files.move(localFile, conflictFile, StandardCopyOption.REPLACE_EXISTING);
-                }
-            }
+            moveUploadedConflict(ws, path, conflictPath, r.getLong("conflictVersion", 1));
 
             notify("WARN", "⚠ Conflict: " + path
                     + " was already updated by another device. "
@@ -298,6 +286,30 @@ public class AgentService implements AutoCloseable {
             state.put(ws, path, newVersion, r.get("checksum"));
         }
         notify("INFO", path + " synchronized (v" + newVersion + ")");
+    }
+
+    private void moveUploadedConflict(long ws, String path, String conflictPath, long version) throws Exception {
+        Map<String, String> workspace = workspace(ws);
+        if (workspace == null)
+            throw new IllegalStateException("Workspace is not available: " + ws);
+
+        Path localFile = safeResolve(workspaceDir(workspace), path);
+        Path conflictFile = safeResolve(workspaceDir(workspace), conflictPath);
+        if (conflictFile.equals(localFile))
+            throw new IllegalStateException("Server conflict-copy path matches the original path");
+        if (!Files.isRegularFile(localFile))
+            return;
+
+        Files.createDirectories(conflictFile.getParent());
+        ignore.ignore(localFile, 3000);
+        ignore.ignore(conflictFile, 3000);
+        try {
+            Files.move(localFile, conflictFile,
+                    StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+        } catch (AtomicMoveNotSupportedException e) {
+            Files.move(localFile, conflictFile, StandardCopyOption.REPLACE_EXISTING);
+        }
+        state.put(ws, conflictPath, version, HashUtil.sha256(conflictFile));
     }
 
     public void syncNow() throws Exception {
@@ -393,8 +405,30 @@ public class AgentService implements AutoCloseable {
             String conflictRel = p.get("path");          // already the conflict-copy path
             String originalPath = p.get("originalPath"); // original file for the notification
             String conflictDevice = p.get("conflictDevice");
+            if (conflictRel.isBlank() || originalPath.isBlank())
+                throw new IllegalStateException("Invalid conflict-copy delivery path");
             String remoteChecksum = p.get("checksum");
             Path conflictTarget = safeResolve(workspaceDir(workspace), conflictRel);
+            Path originalTarget = safeResolve(workspaceDir(workspace), originalPath);
+            if (conflictTarget.equals(originalTarget))
+                throw new IllegalStateException("Conflict-copy delivery targets the original file");
+            if (Files.isRegularFile(conflictTarget)) {
+                String localChecksum = HashUtil.sha256(conflictTarget);
+                long incomingVersion = p.getLong("version", 1);
+                long knownVersion = state.version(ws, conflictRel);
+                if (incomingVersion < knownVersion) {
+                    return;
+                }
+                if (incomingVersion == knownVersion && !Objects.equals(localChecksum, remoteChecksum)) {
+                    warnOnce("conflict-copy-local:" + ws + ":" + conflictRel,
+                            "Newer local changes to conflict copy " + conflictRel
+                                    + " were preserved and will be synchronized.");
+                    scheduleDeferredSync(ws + ":" + conflictRel, conflictRel);
+                    return;
+                }
+                if (incomingVersion > knownVersion && !Objects.equals(localChecksum, remoteChecksum))
+                    createConflictCopy(ws, conflictRel, conflictTarget);
+            }
             Files.createDirectories(conflictTarget.getParent());
             Path staged = Files.createTempFile(conflictTarget.getParent(),
                     conflictTarget.getFileName() + ".", ".tmp");
@@ -439,7 +473,8 @@ public class AgentService implements AutoCloseable {
         Path target = safeResolve(workspaceDir(workspace), rel);
         String localChecksum = Files.isRegularFile(target) ? HashUtil.sha256(target) : "";
         boolean staleRemoteVersion = incomingVersion < knownVersion;
-        boolean sameVersionDifferentContent = !p.getBoolean("conflict", false)
+        boolean authoritative = p.getBoolean("authoritative", p.getBoolean("conflict", false));
+        boolean sameVersionDifferentContent = !authoritative
                 && incomingVersion == knownVersion
                 && !Objects.equals(remoteChecksum, localChecksum) && !localChecksum.isBlank();
         if (staleRemoteVersion || sameVersionDifferentContent) {
@@ -463,7 +498,7 @@ public class AgentService implements AutoCloseable {
                 && !dirty
                 && !Objects.equals(localChecksum, remoteChecksum)
                 ? knownVersion : -1;
-        boolean conflict = p.getBoolean("conflict", false) || dirty;
+        boolean conflict = authoritative || dirty;
         if (conflict && Files.isRegularFile(target)) {
             createConflictCopy(ws, rel, target);
             warnOnce("conflict-local:" + ws + ":" + rel,
@@ -587,7 +622,7 @@ public class AgentService implements AutoCloseable {
                     .with("fileId", p.get("fileId"))
                     .with("version", p.get("version"))
                     .with("checksum", p.get("checksum"))
-                    .with("conflict", p.getBoolean("conflict", false));
+                    .with("authoritative", p.getBoolean("authoritative", p.getBoolean("conflict", false)));
             network.send(relay, file);
         } catch (Exception e) {
             notify("ERROR", "Replica relay failed: " + e.getMessage());
