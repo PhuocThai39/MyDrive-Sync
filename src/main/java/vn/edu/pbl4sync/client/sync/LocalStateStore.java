@@ -64,6 +64,12 @@ public class LocalStateStore {
         return Boolean.parseBoolean(parts(ws, path)[3]);
     }
 
+    public synchronized void clearConflicted(long ws, String path) {
+        String[] current = parts(ws, path);
+        p.setProperty(key(ws, path), current[0] + "|" + current[1] + "|" + current[2] + "|false");
+        save();
+    }
+
     public synchronized void remove(long ws, String path) {
         p.remove(key(ws, path));
         save();

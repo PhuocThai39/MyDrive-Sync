@@ -29,7 +29,7 @@ class RollbackSyncIntegrationTest {
         String dbUrl = "jdbc:h2:mem:rollback_sync_" + System.nanoTime()
                 + ";MODE=MySQL;DB_CLOSE_DELAY=-1;DATABASE_TO_LOWER=TRUE";
         ServerCore server = new ServerCore(new ServerConfig(port, dbUrl, "sa", "",
-                "admin123", 4, 8, 2));
+        "admin123", 4, 8, 2, "DISABLED"));
         NetworkClient client = new NetworkClient();
         CountDownLatch deliveryReceived = new CountDownLatch(1);
         AtomicReference<String> deliveredContent = new AtomicReference<>();

@@ -330,15 +330,53 @@ public class ServerCore implements AutoCloseable {
             Map<String, String> file = db.applyFileChange(ws, path, size, checksum, s.userId(), s.deviceName(),
                     baseVersion, deleted, received.payloadPath());
             if (truthy(file.get("conflict"))) {
+                // OneDrive-style: the conflicting content was saved as a separate conflict-copy
+                // file on the server. Notify the sender that their edit was saved as a conflict
+                // copy, then broadcast that conflict copy to all workspace members so they can
+                // see and resolve it.
+                String conflictPath = file.getOrDefault("conflict_path", "");
+                long conflictFileId = parseLong(file.get("conflict_file_id"), 0);
+                long conflictVersion = parseLong(file.get("conflict_version"), 1);
+                String conflictChecksum = file.getOrDefault("conflict_checksum", "");
+                long conflictSize = parseLong(file.get("conflict_size"), 0);
+
+                // Tell the uploader their content was saved as a conflict copy.
                 s.send(p.response(FILE_EVENT_RESULT)
-                        .with("success", false)
+                        .with("success", true)
                         .with("conflict", true)
                         .with("path", path)
+                        .with("conflictPath", conflictPath)
                         .with("workspaceId", ws)
                         .with("baseVersion", baseVersion)
                         .with("currentVersion", file.getOrDefault("current_version", "0"))
-                        .with("currentChecksum", file.getOrDefault("current_checksum", ""))
-                        .with("currentDeleted", file.getOrDefault("current_deleted", "false")));
+                        .with("currentChecksum", file.getOrDefault("current_checksum", "")));
+
+                // Broadcast the conflict copy as a new FILE_DELIVER so every client
+                // receives it and stores it alongside the winning version.
+                Path cachedConflict = null;
+                try {
+                    cachedConflict = Files.createTempFile("pbl4sync-conflict-relay-", ".tmp");
+                    Files.copy(received.payloadPath(), cachedConflict,
+                            java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                    Packet conflictDeliver = Packet.event(FILE_DELIVER)
+                            .with("workspaceId", ws)
+                            .with("path", conflictPath)
+                            .with("fileId", conflictFileId)
+                            .with("version", conflictVersion)
+                            .with("checksum", conflictChecksum)
+                            .with("size", conflictSize)
+                            .with("conflict", true)
+                            .with("conflictCopy", true)
+                            .with("originalPath", path)
+                            .with("conflictDevice", s.deviceName());
+                    broadcastToWorkspace(ws, conflictDeliver, cachedConflict, 0);
+                    cachedConflict = null;
+
+                    db.logActivity(s.userId(), ws, "CONFLICT",
+                            path + " conflict copy saved as " + conflictPath);
+                } finally {
+                    if (cachedConflict != null) Files.deleteIfExists(cachedConflict);
+                }
                 return;
             }
 
@@ -465,7 +503,10 @@ public class ServerCore implements AutoCloseable {
                 .with("workspaceId", ws).with("path", sanitizeRelativePath(p.get("path")))
                 .with("fileId", p.get("fileId")).with("version", p.get("version"))
                 .with("checksum", p.get("checksum")).with("size", Files.size(cached))
-                .with("conflict", p.getBoolean("conflict", false));
+                .with("conflict", p.getBoolean("conflict", false))
+                .with("conflictCopy", p.getBoolean("conflictCopy", false))
+                .with("originalPath", p.get("originalPath"))
+                .with("conflictDevice", p.get("conflictDevice"));
         sendAndDelete(target, deliver, cached);
     }
 

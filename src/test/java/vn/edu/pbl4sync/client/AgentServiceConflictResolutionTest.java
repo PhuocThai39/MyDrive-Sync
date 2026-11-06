@@ -84,6 +84,48 @@ class AgentServiceConflictResolutionTest {
         }
     }
 
+    @Test
+    void appliesConflictCopyWithoutReplacingOriginalFile() throws Exception {
+        Path syncRoot = temp.resolve("CompanySync");
+        ClientConfig config = new ClientConfig(temp.resolve("client.properties"));
+        config.setSyncRoot(syncRoot);
+
+        try (AgentService service = new AgentService(config)) {
+            Path incoming = temp.resolve("conflict-incoming.txt");
+            Files.writeString(incoming, "second device version");
+            String checksum = HashUtil.sha256(incoming);
+
+            Path original = syncRoot.resolve("7_bin").resolve("bintest.txt");
+            Files.createDirectories(original.getParent());
+            Files.writeString(original, "server winning version");
+
+            LocalStateStore state = new LocalStateStore(syncRoot);
+            state.put(7, "bintest.txt", 3, HashUtil.sha256(original));
+            setField(service, "state", state);
+            setField(service, "workspaces", List.of(Map.of("id", "7", "name", "bin")));
+
+            String conflictPath = "bintest_conflict_LaptopA_20261106_100513.txt";
+            Packet delivery = Packet.event(FILE_DELIVER)
+                    .with("workspaceId", 7)
+                    .with("path", conflictPath)
+                    .with("version", 1)
+                    .with("checksum", checksum)
+                    .with("conflict", true)
+                    .with("conflictCopy", true)
+                    .with("originalPath", "bintest.txt")
+                    .with("conflictDevice", "LaptopA");
+            Method apply = AgentService.class.getDeclaredMethod("applyDeliveredFile", Packet.class, Path.class);
+            apply.setAccessible(true);
+            apply.invoke(service, delivery, incoming);
+
+            assertEquals("server winning version", Files.readString(original));
+            assertEquals("second device version",
+                    Files.readString(syncRoot.resolve("7_bin").resolve(conflictPath)));
+            assertEquals(1, state.version(7, conflictPath));
+            assertEquals(checksum, state.checksum(7, conflictPath));
+        }
+    }
+
     private static Object getField(Object target, String name) throws Exception {
         Field field = target.getClass().getDeclaredField(name);
         field.setAccessible(true);

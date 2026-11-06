@@ -262,9 +262,16 @@ public class AgentService implements AutoCloseable {
             return;
 
         if (r.getBoolean("conflict", false)) {
-            state.markConflicted(ws, path);
-            warnOnce("conflict-upload:" + ws + ":" + path,
-                    path + " conflicted: local base v" + baseVersion + ", server is v" + r.get("currentVersion"));
+            // OneDrive-style: server accepted our content but saved it as a conflict copy.
+            // The local file (which is the conflict copy) is now in sync with the server
+            // under the conflict-copy path; clear the conflicted flag.
+            String conflictPath = r.get("conflictPath");
+            notify("WARN", "⚠ Conflict: " + path
+                    + " was already updated by another device. "
+                    + "Your version was saved as: " + conflictPath
+                    + ". Original file (server version v" + r.get("currentVersion") + ") was kept.");
+            state.clearConflicted(ws, path);
+            // Trigger a sync to pull the winning (server) version of the original file.
             syncNow();
             return;
         }
@@ -362,6 +369,48 @@ public class AgentService implements AutoCloseable {
         if (tempPayload == null)
             return;
         long ws = p.getLong("workspaceId", 0);
+
+        // OneDrive-style conflict copy: the server already gave this file a unique
+        // conflict-copy path (e.g. report_conflict_LaptopA_20261106_084532.docx).
+        // Write it straight to that path without touching the winning version.
+        if (p.getBoolean("conflictCopy", false)) {
+            Map<String, String> workspace = workspace(ws);
+            if (workspace == null) { refreshWorkspaces(); workspace = workspace(ws); }
+            if (workspace == null) return;
+            String conflictRel = p.get("path");          // already the conflict-copy path
+            String originalPath = p.get("originalPath"); // original file for the notification
+            String conflictDevice = p.get("conflictDevice");
+            String remoteChecksum = p.get("checksum");
+            Path conflictTarget = safeResolve(workspaceDir(workspace), conflictRel);
+            Files.createDirectories(conflictTarget.getParent());
+            Path staged = Files.createTempFile(conflictTarget.getParent(),
+                    conflictTarget.getFileName() + ".", ".tmp");
+            try {
+                Files.copy(tempPayload, staged, StandardCopyOption.REPLACE_EXISTING);
+                if (!Objects.equals(HashUtil.sha256(staged), remoteChecksum)) {
+                    throw new IllegalStateException(
+                            "Conflict copy checksum does not match server metadata");
+                }
+                ignore.ignore(conflictTarget, 3000);
+                try {
+                    Files.move(staged, conflictTarget,
+                            StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+                } catch (AtomicMoveNotSupportedException e) {
+                    Files.move(staged, conflictTarget, StandardCopyOption.REPLACE_EXISTING);
+                }
+            } finally {
+                Files.deleteIfExists(staged);
+            }
+            // Update local state so the conflict copy itself is tracked.
+            state.put(ws, conflictRel, p.getLong("version", 1), remoteChecksum);
+            String msg = "⚠ Conflict: " + (originalPath != null ? originalPath : conflictRel)
+                    + " was edited on " + (conflictDevice != null ? conflictDevice : "another device")
+                    + " while you had unsaved changes. "
+                    + "Their version was saved as: " + conflictRel;
+            notify("WARN", msg);
+            return;
+        }
+
         Map<String, String> workspace = workspace(ws);
         if (workspace == null) {
             refreshWorkspaces();

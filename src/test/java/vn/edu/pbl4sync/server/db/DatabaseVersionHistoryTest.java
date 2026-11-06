@@ -33,7 +33,7 @@ class DatabaseVersionHistoryTest {
     void setUp() throws Exception {
         url = "jdbc:h2:mem:versions_" + System.nanoTime()
                 + ";MODE=MySQL;DB_CLOSE_DELAY=-1;DATABASE_TO_LOWER=TRUE";
-        database = new Database(url, "sa", "", 4, "admin-pass");
+        database = new Database(url, "sa", "", 4, new java.util.Properties(), "admin-pass");
         userId = Long.parseLong(database.findUserByUsername("admin").get("id"));
         workspaceId = database.createWorkspace(userId, "Version Tests", "admin");
     }
