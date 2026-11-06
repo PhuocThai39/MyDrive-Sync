@@ -17,11 +17,12 @@ import java.util.List;
  * các chunk bị ảnh hưởng thay đổi — các chunk còn lại vẫn giữ nguyên hash
  * và không cần upload lại (delta upload).
  *
- * <p>Tham số mặc định:
+ * <p>Tham số mặc định được giữ dưới 1 MiB để tương thích với giới hạn
+ * {@code max_allowed_packet} mặc định của MySQL:
  * <ul>
- *   <li>Chunk mục tiêu : 4 MB  (khi fingerprint & MASK_TARGET == 0)
- *   <li>Chunk tối thiểu: 1 MB  (không cắt sớm hơn)
- *   <li>Chunk tối đa  : 16 MB (buộc cắt nếu chưa tìm được điểm tự nhiên)
+ *   <li>Chunk mục tiêu : 256 KiB (khi fingerprint & MASK_TARGET == 0)
+ *   <li>Chunk tối thiểu: 64 KiB (không cắt sớm hơn)
+ *   <li>Chunk tối đa  : 512 KiB (buộc cắt nếu chưa tìm được điểm tự nhiên)
  * </ul>
  */
 public final class RabinChunker {
@@ -69,20 +70,20 @@ public final class RabinChunker {
     // Chunk-size thresholds
     // ---------------------------------------------------------------------------
 
-    /** Chunk tối thiểu: 1 MB — không cắt trước ngưỡng này. */
-    public static final int MIN_SIZE = 1 * 1024 * 1024;
+    /** Chunk tối thiểu: 64 KiB — không cắt trước ngưỡng này. */
+    public static final int MIN_SIZE = 64 * 1024;
 
-    /** Chunk mục tiêu: 4 MB — mask 22 bit để xác suất cắt ≈ 1/4MB. */
-    public static final int TARGET_SIZE = 4 * 1024 * 1024;
+    /** Chunk mục tiêu: 256 KiB — mask 18 bit để xác suất cắt ≈ 1/4 MiB. */
+    public static final int TARGET_SIZE = 256 * 1024;
 
-    /** Chunk tối đa: 16 MB — buộc cắt nếu chưa tìm được điểm tự nhiên. */
-    public static final int MAX_SIZE = 16 * 1024 * 1024;
+    /** Chunk tối đa: 512 KiB — đủ khoảng trống dưới MySQL packet limit 1 MiB. */
+    public static final int MAX_SIZE = 512 * 1024;
 
     /**
-     * Mask 22 bit: fingerprint & MASK_TARGET == 0 xác suất ≈ 1/4M byte,
-     * tức trung bình mỗi chunk ~4 MB.
+     * Mask 18 bit: fingerprint & MASK_TARGET == 0 xác suất ≈ 1/256 KiB,
+     * tức trung bình mỗi chunk ~256 KiB.
      */
-    private static final long MASK_TARGET = (1L << 22) - 1;
+    private static final long MASK_TARGET = (1L << 18) - 1;
 
     // ---------------------------------------------------------------------------
     // Public API

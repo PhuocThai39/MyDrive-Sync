@@ -350,6 +350,14 @@ public class ServerCore implements AutoCloseable {
             s.send(p.response(ERROR).with("message", "Missing chunk hash or payload"));
             return;
         }
+        long payloadSize = Files.size(received.payloadPath());
+        if (payloadSize != size) {
+            throw new IllegalArgumentException("Chunk size does not match its payload");
+        }
+        if (payloadSize > RabinChunker.MAX_SIZE) {
+            throw new IllegalArgumentException("Chunk exceeds the supported maximum of "
+                    + RabinChunker.MAX_SIZE + " bytes; update the client to use smaller CDC chunks");
+        }
         // Xác minh hash trước khi lưu
         String actualHash = HashUtil.sha256(received.payloadPath());
         if (!actualHash.equals(hash)) {
