@@ -17,7 +17,10 @@ public class FolderWatcher implements AutoCloseable {
     private final Map<WatchKey, Path> keys = new ConcurrentHashMap<>();
     private final ScheduledExecutorService debounce = Executors.newSingleThreadScheduledExecutor();
     private final Map<Path, Pending> pending = new ConcurrentHashMap<>();
+    private final Map<Path, Long> directoryActivity = new ConcurrentHashMap<>();
     private volatile boolean running = true;
+
+    private static final long DELETE_QUIET_PERIOD_MILLIS = 2_000;
 
     private record Pending(String action, ScheduledFuture<?> future) { }
 
@@ -53,6 +56,7 @@ public class FolderWatcher implements AutoCloseable {
             for (WatchEvent<?> e : key.pollEvents()) {
                 if (e.kind() == OVERFLOW) continue;
                 Path child = dir.resolve((Path)e.context()).toAbsolutePath().normalize();
+                directoryActivity.put(dir, System.currentTimeMillis());
                 if (ignore.shouldIgnore(child) || SyncFileFilter.shouldIgnore(child)) {
                  continue;
                 }
@@ -72,65 +76,100 @@ public class FolderWatcher implements AutoCloseable {
     }
 
     private void schedule(Path absolute, String relative, String action) {
-    Pending old = pending.get(absolute);
+        Pending old = pending.get(absolute);
 
-    // Hủy event đang chờ của cùng file
-    if (old != null) {
-        old.future().cancel(false);
-    }
+        // Hủy event đang chờ của cùng file
+        if (old != null) {
+            old.future().cancel(false);
+        }
 
-    // DELETE: chưa gửi ngay, chờ xem có CREATE lại không
-    if ("DELETE".equals(action)) {
+        // DELETE: chưa gửi ngay, chờ xem có CREATE lại không
+        if ("DELETE".equals(action)) {
+            scheduleDeleteCheck(absolute, relative);
+            return;
+        }
+
+        String effective = action;
+
+        // DELETE -> CREATE nhanh
+        // => ứng dụng đang thay thế file cũ
+        // => coi toàn bộ là MODIFY
+        if (old != null && "DELETE".equals(old.action())
+                && "CREATE".equals(action)) {
+            effective = "MODIFY";
+        }
+
+        // CREATE -> MODIFY
+        // => file vừa tạo xong rồi tiếp tục được ghi
+        if (old != null && "CREATE".equals(old.action())
+                && "MODIFY".equals(action)) {
+            effective = "CREATE";
+        }
+
+        String finalAction = effective;
+
         ScheduledFuture<?> future = debounce.schedule(() -> {
             pending.remove(absolute);
 
-            // Sau thời gian chờ mà file vẫn không tồn tại
-            // => đây mới là DELETE thật
             if (!ignore.shouldIgnore(absolute)
                     && !SyncFileFilter.shouldIgnore(absolute)
-                    && !Files.exists(absolute)) {
+                    && Files.exists(absolute)
+                    && Files.isRegularFile(absolute)) {
 
-                callback.accept("DELETE", relative);
+                callback.accept(finalAction, relative);
             }
-        }, 900, TimeUnit.MILLISECONDS);
+        }, 550, TimeUnit.MILLISECONDS);
 
+        pending.put(absolute, new Pending(effective, future));
+    }
+
+    private void scheduleDeleteCheck(Path absolute, String relative) {
+        ScheduledFuture<?> future = debounce.schedule(
+                () -> checkPendingDelete(absolute, relative), 900, TimeUnit.MILLISECONDS);
         pending.put(absolute, new Pending("DELETE", future));
-        return;
     }
 
-    String effective = action;
-
-    // DELETE -> CREATE nhanh
-    // => Word/Office đang thay thế file cũ
-    // => coi toàn bộ là MODIFY
-    if (old != null && "DELETE".equals(old.action())
-            && "CREATE".equals(action)) {
-        effective = "MODIFY";
-    }
-
-    // CREATE -> MODIFY
-    // => file vừa tạo xong rồi tiếp tục được ghi
-    if (old != null && "CREATE".equals(old.action())
-            && "MODIFY".equals(action)) {
-        effective = "CREATE";
-    }
-
-    String finalAction = effective;
-
-    ScheduledFuture<?> future = debounce.schedule(() -> {
-        pending.remove(absolute);
-
-        if (!ignore.shouldIgnore(absolute)
-                && !SyncFileFilter.shouldIgnore(absolute)
-                && Files.exists(absolute)
-                && Files.isRegularFile(absolute)) {
-
-            callback.accept(finalAction, relative);
+    private void rescheduleDeleteCheck(Path absolute, String relative, Pending current) {
+        ScheduledFuture<?> future = debounce.schedule(
+                () -> checkPendingDelete(absolute, relative), 900, TimeUnit.MILLISECONDS);
+        if (!pending.replace(absolute, current, new Pending("DELETE", future))) {
+            future.cancel(false);
         }
-    }, 550, TimeUnit.MILLISECONDS);
+    }
 
-    pending.put(absolute, new Pending(effective, future));
-}
+    private void checkPendingDelete(Path absolute, String relative) {
+        Pending current = pending.get(absolute);
+        if (current == null || !"DELETE".equals(current.action())) return;
+
+        if (ignore.shouldIgnore(absolute)
+                || SyncFileFilter.shouldIgnore(absolute)
+                || Files.exists(absolute)) {
+            pending.remove(absolute, current);
+            return;
+        }
+
+        if (hasDownloadInProgress(absolute)) {
+            rescheduleDeleteCheck(absolute, relative, current);
+            return;
+        }
+
+        long lastActivity = directoryActivity.getOrDefault(absolute.getParent(), 0L);
+        if (System.currentTimeMillis() - lastActivity < DELETE_QUIET_PERIOD_MILLIS) {
+            rescheduleDeleteCheck(absolute, relative, current);
+            return;
+        }
+
+        if (pending.remove(absolute, current)) {
+            callback.accept("DELETE", relative);
+        }
+    }
+
+    private boolean hasDownloadInProgress(Path target) {
+        String name = target.getFileName().toString();
+        return Files.exists(target.resolveSibling(name + ".crdownload"))
+                || Files.exists(target.resolveSibling(name + ".part"))
+                || Files.exists(target.resolveSibling(name + ".download"));
+    }
 
     @Override public void close() {
         running = false;

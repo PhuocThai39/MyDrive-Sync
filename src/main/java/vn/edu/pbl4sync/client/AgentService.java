@@ -392,6 +392,7 @@ public class AgentService implements AutoCloseable {
                     row.put("size", String.valueOf(Files.size(p)));
                     row.put("checksum", HashUtil.sha256(p));
                     row.put("known_version", String.valueOf(state.version(wsId, rel)));
+                    row.put("known_checksum", state.checksum(wsId, rel));
                     row.put("conflicted", String.valueOf(state.isConflicted(wsId, rel)));
                     rows.add(row);
                 }

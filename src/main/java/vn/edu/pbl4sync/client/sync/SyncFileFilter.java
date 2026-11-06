@@ -21,8 +21,10 @@ public final class SyncFileFilter {
             || name.startsWith("~WRC")
             || name.endsWith(".tmp")
             || name.endsWith(".bak")
+            || name.endsWith(".crdownload")
+            || name.endsWith(".part")
+            || name.endsWith(".download")
             || name.equalsIgnoreCase("Thumbs.db")
-            || name.equalsIgnoreCase("desktop.ini")
-            || name.endsWith(".crdownload");
+            || name.equalsIgnoreCase("desktop.ini");
 }
 }

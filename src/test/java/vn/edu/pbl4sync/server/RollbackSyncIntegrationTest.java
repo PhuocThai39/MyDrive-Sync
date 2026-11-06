@@ -8,6 +8,7 @@ import vn.edu.pbl4sync.common.HashUtil;
 import vn.edu.pbl4sync.common.MessageTypes;
 import vn.edu.pbl4sync.common.Packet;
 import vn.edu.pbl4sync.common.RabinChunker;
+import vn.edu.pbl4sync.common.TableCodec;
 
 import java.net.ServerSocket;
 import java.nio.file.Files;
@@ -16,6 +17,7 @@ import java.time.Duration;
 import java.util.Arrays;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
@@ -104,6 +106,66 @@ class RollbackSyncIntegrationTest {
         } finally {
             client.close();
             secondClient.close();
+            server.close();
+        }
+    }
+
+    @Test
+    void syncReportPreservesLocalFileChangedAfterServerDelete() throws Exception {
+        int port;
+        try (ServerSocket socket = new ServerSocket(0)) {
+            port = socket.getLocalPort();
+        }
+        String dbUrl = "jdbc:h2:mem:deleted_sync_" + System.nanoTime()
+                + ";MODE=MySQL;DB_CLOSE_DELAY=-1;DATABASE_TO_LOWER=TRUE";
+        ServerCore server = new ServerCore(new ServerConfig(port, dbUrl, "sa", "",
+                "admin123", 4, 8, 2, "DISABLED"));
+        NetworkClient client = new NetworkClient();
+        AtomicReference<String> requestedUploadAction = new AtomicReference<>();
+        CountDownLatch uploadRequested = new CountDownLatch(1);
+        client.setEventHandler(received -> {
+            if (!MessageTypes.FILE_UPLOAD_REQUEST.equals(received.packet().type())) return;
+            requestedUploadAction.set(received.packet().get("action"));
+            uploadRequested.countDown();
+        });
+
+        try {
+            server.start();
+            client.connect("127.0.0.1", port);
+            assertLogin(client, "DeletedSyncTest");
+
+            Packet workspace = client.request(Packet.request(MessageTypes.CREATE_WORKSPACE_REQUEST)
+                    .with("name", "Deleted Sync Integration").with("leaderUsername", "admin"),
+                    Duration.ofSeconds(10));
+            assertEquals(MessageTypes.OK, workspace.type());
+            long workspaceId = workspace.getLong("workspaceId", 0);
+
+            Packet uploaded = upload(client, workspaceId, write("original"), 0);
+            assertEquals("1", uploaded.get("version"));
+            Packet deleted = client.request(Packet.request(MessageTypes.FILE_EVENT)
+                    .with("workspaceId", workspaceId).with("path", "a1.txt")
+                    .with("action", "DELETE").with("baseVersion", 1), Duration.ofSeconds(10));
+            assertEquals(MessageTypes.FILE_EVENT_RESULT, deleted.type());
+            assertEquals("2", deleted.get("version"));
+
+            Path recreated = write("recreated after delete");
+            Map<String, String> local = new java.util.LinkedHashMap<>();
+            local.put("workspace_id", String.valueOf(workspaceId));
+            local.put("path", "a1.txt");
+            local.put("size", String.valueOf(Files.size(recreated)));
+            local.put("checksum", HashUtil.sha256(recreated));
+            local.put("known_version", "2");
+            local.put("known_checksum", "");
+            local.put("conflicted", "false");
+
+            Packet sync = client.request(Packet.request(MessageTypes.SYNC_REPORT)
+                    .with("rows", TableCodec.encode(List.of(local)))
+                    .with("backups", TableCodec.encode(List.of())), Duration.ofSeconds(10));
+            assertEquals(MessageTypes.SYNC_REPORT_RESULT, sync.type());
+            assertTrue(uploadRequested.await(5, TimeUnit.SECONDS));
+            assertEquals("CREATE", requestedUploadAction.get());
+        } finally {
+            client.close();
             server.close();
         }
     }

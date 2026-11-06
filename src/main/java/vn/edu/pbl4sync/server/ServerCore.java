@@ -654,8 +654,27 @@ public class ServerCore implements AutoCloseable {
 
             if (deleted) {
                 if (l != null) {
-                    s.send(Packet.event(FILE_DELETE).with("workspaceId", ws).with("path", path).with("fileId", f.get("id")).with("version", serverVersion));
-                    actions++;
+                    String localChecksum = l.getOrDefault("checksum", "");
+                    String knownChecksum = l.getOrDefault("known_checksum", "");
+                    if (l.containsKey("known_checksum")
+                            && !Objects.equals(localChecksum, knownChecksum)) {
+                        if (db.hasPermission(s.userId(), s.isAdmin(), ws, "WRITE")) {
+                            s.send(Packet.event(FILE_UPLOAD_REQUEST)
+                                    .with("workspaceId", ws)
+                                    .with("path", path)
+                                    .with("action", "CREATE"));
+                            actions++;
+                        } else {
+                            s.send(Packet.event(CONFLICT_NOTICE)
+                                    .with("workspaceId", ws)
+                                    .with("path", path)
+                                    .with("message", "Server file is deleted but local changes were preserved because this user has no WRITE permission"));
+                        }
+                    } else {
+                        s.send(Packet.event(FILE_DELETE).with("workspaceId", ws).with("path", path)
+                                .with("fileId", f.get("id")).with("version", serverVersion));
+                        actions++;
+                    }
                 }
                 continue;
             }
