@@ -111,6 +111,29 @@ class DatabaseVersionHistoryTest {
     }
 
     @Test
+    void addsMissingContentColumnsToExistingVersionTables() throws Exception {
+        String legacyUrl = "jdbc:h2:mem:legacy_versions_" + System.nanoTime()
+                + ";MODE=MySQL;DB_CLOSE_DELAY=-1;DATABASE_TO_LOWER=TRUE";
+        try (var connection = DriverManager.getConnection(legacyUrl, "sa", "");
+             var statement = connection.createStatement()) {
+            statement.execute("CREATE TABLE file_versions (id BIGINT PRIMARY KEY)");
+            statement.execute("CREATE TABLE file_conflicts (id BIGINT PRIMARY KEY)");
+        }
+
+        try (Database upgraded = new Database(legacyUrl, "sa", "", 4,
+                new java.util.Properties(), "admin-pass");
+             var connection = DriverManager.getConnection(legacyUrl, "sa", "");
+             var statement = connection.createStatement()) {
+            try (var versions = statement.executeQuery("SELECT content FROM file_versions WHERE 1=0")) {
+                assertFalse(versions.next());
+            }
+            try (var conflicts = statement.executeQuery("SELECT content FROM file_conflicts WHERE 1=0")) {
+                assertFalse(conflicts.next());
+            }
+        }
+    }
+
+    @Test
     void rollbackToOlderContentCreatesNewMonotonicVersionAndChecksExpectedCurrent() throws Exception {
         Map<String, String> current = update("a1.txt", "v1", 0);
         update("a1.txt", "v2", 1);

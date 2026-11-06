@@ -387,19 +387,43 @@ public class ServerCore implements AutoCloseable {
         boolean deleted = "DELETE".equals(action);
         long baseVersion = p.getLong("baseVersion", 0);
         Path cached = null;
+        Path assembled = null;
         try {
             long size = 0;
             String checksum = "";
+            Path content = received.payloadPath();
             if (!deleted) {
-                if (received.payloadPath() == null) throw new IllegalArgumentException("File payload required");
-                size = Files.size(received.payloadPath());
-                checksum = HashUtil.sha256(received.payloadPath());
+                String manifestText = p.get("manifest");
+                if (!manifestText.isBlank()) {
+                    ChunkManifest manifest = ChunkManifest.parse(manifestText);
+                    size = manifest.totalSize();
+                    if (p.getLong("size", -1) != size) {
+                        throw new IllegalArgumentException("File size does not match chunk manifest");
+                    }
+                    assembled = Files.createTempFile("pbl4sync-assembled-", ".tmp");
+                    manifest.assembleTo(assembled, hash -> {
+                        try {
+                            return chunkStore.loadChunk(hash);
+                        } catch (java.sql.SQLException e) {
+                            throw new IOException("Could not load chunk from storage: " + hash, e);
+                        }
+                    });
+                    content = assembled;
+                    checksum = HashUtil.sha256(content);
+                    if (!checksum.equals(p.get("checksum"))) {
+                        throw new IllegalArgumentException("File checksum does not match uploaded chunks");
+                    }
+                } else {
+                    if (content == null) throw new IllegalArgumentException("File payload or chunk manifest required");
+                    size = Files.size(content);
+                    checksum = HashUtil.sha256(content);
+                }
                 cached = Files.createTempFile("pbl4sync-relay-", ".tmp");
-                Files.copy(received.payloadPath(), cached, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                Files.copy(content, cached, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
             }
 
             Map<String, String> file = db.applyFileChange(ws, path, size, checksum, s.userId(), s.deviceName(),
-                    baseVersion, deleted, received.payloadPath());
+                    baseVersion, deleted, content);
             if (truthy(file.get("conflict"))) {
                 // OneDrive-style: the conflicting content was saved as a separate conflict-copy
                 // file on the server. Notify the sender that their edit was saved as a conflict
@@ -427,7 +451,7 @@ public class ServerCore implements AutoCloseable {
                 Path cachedConflict = null;
                 try {
                     cachedConflict = Files.createTempFile("pbl4sync-conflict-relay-", ".tmp");
-                    Files.copy(received.payloadPath(), cachedConflict,
+                    Files.copy(content, cachedConflict,
                             java.nio.file.StandardCopyOption.REPLACE_EXISTING);
                     Packet conflictDeliver = Packet.event(FILE_DELIVER)
                             .with("workspaceId", ws)
@@ -488,6 +512,7 @@ public class ServerCore implements AutoCloseable {
             }
         } finally {
             if (cached != null) Files.deleteIfExists(cached);
+            if (assembled != null) Files.deleteIfExists(assembled);
         }
     }
 

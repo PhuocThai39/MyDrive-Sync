@@ -106,6 +106,7 @@ public class Database implements AutoCloseable {
               base_version BIGINT NOT NULL,
               checksum VARCHAR(128),
               is_deleted BOOLEAN NOT NULL DEFAULT FALSE,
+              content LONGBLOB,
               manifest TEXT,
               source_user_id BIGINT,
               source_device VARCHAR(180) NOT NULL DEFAULT '',
@@ -147,6 +148,7 @@ public class Database implements AutoCloseable {
               base_version BIGINT NOT NULL,
               current_version BIGINT NOT NULL,
               checksum VARCHAR(128) NOT NULL,
+              content LONGBLOB,
               manifest TEXT,
               source_user_id BIGINT,
               source_device VARCHAR(180) NOT NULL DEFAULT '',
@@ -174,8 +176,19 @@ public class Database implements AutoCloseable {
         Connection c = pool.borrow();
         try (Statement st = c.createStatement()) {
             for (String sql : ddl) st.execute(sql);
+            ensureColumn(c, "file_versions", "content", "LONGBLOB");
+            ensureColumn(c, "file_conflicts", "content", "LONGBLOB");
         } finally {
             pool.release(c);
+        }
+    }
+
+    private void ensureColumn(Connection c, String table, String column, String definition) throws SQLException {
+        try (ResultSet columns = c.getMetaData().getColumns(c.getCatalog(), null, table, column)) {
+            if (columns.next()) return;
+        }
+        try (Statement statement = c.createStatement()) {
+            statement.execute("ALTER TABLE " + table + " ADD COLUMN " + column + " " + definition);
         }
     }
 
@@ -481,7 +494,7 @@ public class Database implements AutoCloseable {
                     long conflictId = insertNewFile(c, workspaceId, conflictPath, size, checksum, userId, false);
                     insertFileVersion(c, conflictId, 1, baseVersion, checksum, false, payload,
                             userId, deviceName, "CONFLICT", null);
-                    saveConflict(c, conflictId, workspaceId, path, baseVersion, currentVersion, checksum,
+                    saveConflict(c, id, workspaceId, path, baseVersion, currentVersion, checksum,
                             payload, userId, deviceName);
                     c.commit();
                     return row(
