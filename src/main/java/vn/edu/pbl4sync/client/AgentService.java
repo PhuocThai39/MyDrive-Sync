@@ -262,16 +262,29 @@ public class AgentService implements AutoCloseable {
             return;
 
         if (r.getBoolean("conflict", false)) {
-            // OneDrive-style: server accepted our content but saved it as a conflict copy.
-            // The local file (which is the conflict copy) is now in sync with the server
-            // under the conflict-copy path; clear the conflicted flag.
             String conflictPath = r.get("conflictPath");
+            if (conflictPath.isBlank())
+                throw new IllegalStateException("Server reported a conflict without a conflict-copy path");
+
+            Path localFile = safeResolve(workspaceDir(workspace), path);
+            if (Files.isRegularFile(localFile)) {
+                Path conflictFile = safeResolve(workspaceDir(workspace), conflictPath);
+                Files.createDirectories(conflictFile.getParent());
+                ignore.ignore(localFile, 3000);
+                ignore.ignore(conflictFile, 3000);
+                try {
+                    Files.move(localFile, conflictFile,
+                            StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+                } catch (AtomicMoveNotSupportedException e) {
+                    Files.move(localFile, conflictFile, StandardCopyOption.REPLACE_EXISTING);
+                }
+            }
+
             notify("WARN", "⚠ Conflict: " + path
                     + " was already updated by another device. "
                     + "Your version was saved as: " + conflictPath
                     + ". Original file (server version v" + r.get("currentVersion") + ") was kept.");
             state.clearConflicted(ws, path);
-            // Trigger a sync to pull the winning (server) version of the original file.
             syncNow();
             return;
         }
