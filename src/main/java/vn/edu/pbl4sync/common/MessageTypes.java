@@ -52,4 +52,28 @@ public final class MessageTypes {
     public static final String CONFLICT_NOTICE = "CONFLICT_NOTICE";
     public static final String NOTIFICATION = "NOTIFICATION";
     public static final String WORKSPACES_CHANGED = "WORKSPACES_CHANGED";
+
+    // --- CDC chunk protocol ---
+
+    /**
+     * Client → Server: gửi manifest (danh sách hash) của version mới.
+     * Server kiểm tra chunk nào còn thiếu và trả về CHUNK_QUERY_RESULT.
+     * Fields: workspaceId, path, checksum, size, baseVersion, manifest (text)
+     */
+    public static final String CHUNK_QUERY = "CHUNK_QUERY";
+
+    /**
+     * Server → Client: danh sách hash còn thiếu trong chunk store.
+     * Client chỉ upload đúng những chunk này (delta upload).
+     * Fields: missingHashes (CSV), requestId (echo từ CHUNK_QUERY)
+     */
+    public static final String CHUNK_QUERY_RESULT = "CHUNK_QUERY_RESULT";
+
+    /**
+     * Client → Server: upload một chunk còn thiếu.
+     * Payload = nội dung chunk thô (binary).
+     * Fields: hash, size
+     * Sau khi upload đủ tất cả chunk thiếu, client gửi FILE_EVENT bình thường.
+     */
+    public static final String CHUNK_UPLOAD = "CHUNK_UPLOAD";
 }

@@ -1,6 +1,7 @@
 package vn.edu.pbl4sync.server;
 
 import vn.edu.pbl4sync.common.*;
+import vn.edu.pbl4sync.server.db.ChunkStore;
 import vn.edu.pbl4sync.server.db.Database;
 
 import java.io.IOException;
@@ -29,6 +30,7 @@ public class ServerCore implements AutoCloseable {
     private volatile boolean running;
     private ServerSocket serverSocket;
     private Database db;
+    private ChunkStore chunkStore;
 
     public ServerCore(ServerConfig config) { this.config = config; }
 
@@ -37,6 +39,7 @@ public class ServerCore implements AutoCloseable {
         var tlsContext = TlsSupport.serverContext();
         db = new Database(config.dbUrl(), config.dbUser(), config.dbPassword(), config.dbPoolSize(),
                 config.dbConnectionProperties(), config.initialAdminPassword());
+        chunkStore = new ChunkStore(db.pool());
         clientPool = Executors.newFixedThreadPool(config.clientThreads());
         transferPool = Executors.newFixedThreadPool(config.transferThreads());
         SSLServerSocket tlsServerSocket = (SSLServerSocket) tlsContext.getServerSocketFactory()
@@ -92,6 +95,8 @@ public class ServerCore implements AutoCloseable {
             case REMOVE_MEMBER_REQUEST -> removeMember(session, p);
             case CHANGE_LEADER_REQUEST -> changeLeader(session, p);
             case DELETE_WORKSPACE_REQUEST -> deleteWorkspace(session, p);
+            case CHUNK_QUERY -> chunkQuery(session, p);
+            case CHUNK_UPLOAD -> chunkUpload(session, received);
             case FILE_EVENT -> fileEvent(session, received);
             case FILE_APPLIED -> fileApplied(session, p);
             case FILE_RELAY_UPLOAD -> relayUpload(session, received);
@@ -180,12 +185,36 @@ public class ServerCore implements AutoCloseable {
                 broadcastToWorkspace(ws, Packet.event(FILE_DELETE).with("workspaceId", ws)
                         .with("path", path).with("fileId", fileId).with("version", version), null, 0);
             } else {
-                Path content = Path.of(result.get("content_path"));
-                Packet deliver = Packet.event(FILE_DELIVER).with("workspaceId", ws).with("path", path)
-                        .with("fileId", fileId).with("version", version)
-                        .with("checksum", result.get("checksum")).with("size", result.get("size"))
-                        .with("conflict", false);
-                broadcastToWorkspace(ws, deliver, content, 0);
+                // Assemble file từ chunk store theo manifest của targetVersion
+                long targetSize = parseLong(result.get("size"), 0);
+                ChunkManifest manifest = chunkStore.loadManifest(fileId,
+                        parseLong(result.get("rollback_from_version"), 0), targetSize);
+                Path assembled = Files.createTempFile("pbl4sync-rollback-assembled-", ".tmp");
+                try {
+                    if (manifest != null) {
+                        manifest.assembleTo(assembled, hash -> {
+                            try {
+                                return chunkStore.loadChunk(hash);
+                            } catch (java.sql.SQLException e) {
+                                throw new java.util.concurrent.CompletionException(e);
+                            }
+                        });
+                    } else {
+                        // Fallback: đọc từ content BLOB nếu version cũ chưa có chunk
+                        db.copyFileVersion(fileId,
+                                parseLong(result.get("rollback_from_version"), 0), assembled);
+                    }
+                    Packet deliver = Packet.event(FILE_DELIVER)
+                            .with("workspaceId", ws).with("path", path)
+                            .with("fileId", fileId).with("version", version)
+                            .with("checksum", result.get("checksum"))
+                            .with("size", result.get("size"))
+                            .with("conflict", false);
+                    broadcastToWorkspace(ws, deliver, assembled, 0);
+                    assembled = null;
+                } finally {
+                    if (assembled != null) Files.deleteIfExists(assembled);
+                }
             }
         }
     }
@@ -291,6 +320,48 @@ public class ServerCore implements AutoCloseable {
         broadcastWorkspacesChanged();
     }
 
+    /**
+     * Client gửi manifest (danh sách hash) của version mới.
+     * Server kiểm tra chunk nào còn thiếu và trả về danh sách hash đó.
+     * Client chỉ upload đúng những chunk còn thiếu (delta upload).
+     */
+    private void chunkQuery(ClientSession s, Packet p) throws Exception {
+        String manifestText = p.get("manifest");
+        if (manifestText == null || manifestText.isBlank()) {
+            s.send(p.response(ERROR).with("message", "Missing manifest"));
+            return;
+        }
+        ChunkManifest manifest = ChunkManifest.parse(manifestText);
+        java.util.Set<String> missing = chunkStore.missingHashes(manifest.allHashes());
+        // Trả về danh sách hash còn thiếu dưới dạng CSV
+        String missingCsv = String.join(",", missing);
+        s.send(p.response(CHUNK_QUERY_RESULT).with("missingHashes", missingCsv));
+    }
+
+    /**
+     * Client upload một chunk còn thiếu (payload = nội dung chunk thô).
+     * Server lưu vào bảng chunks với INSERT IGNORE (deduplication tự động).
+     */
+    private void chunkUpload(ClientSession s, ReceivedPacket received) throws Exception {
+        Packet p = received.packet();
+        String hash = p.get("hash");
+        int size = p.getInt("size", 0);
+        if (hash == null || hash.isBlank() || received.payloadPath() == null) {
+            s.send(p.response(ERROR).with("message", "Missing chunk hash or payload"));
+            return;
+        }
+        // Xác minh hash trước khi lưu
+        String actualHash = HashUtil.sha256(received.payloadPath());
+        if (!actualHash.equals(hash)) {
+            s.send(p.response(ERROR).with("message",
+                    "Chunk hash mismatch: expected " + hash + ", got " + actualHash));
+            return;
+        }
+        byte[] content = Files.readAllBytes(received.payloadPath());
+        chunkStore.saveChunk(hash, size, content);
+        s.send(p.response(OK).with("hash", hash));
+    }
+
     private void fileEvent(ClientSession s, ReceivedPacket received) throws Exception {
         Packet p = received.packet();
         long ws = p.getLong("workspaceId", 0);
@@ -381,7 +452,15 @@ public class ServerCore implements AutoCloseable {
 
             long fileId = Long.parseLong(file.get("id"));
             long version = Long.parseLong(file.get("version"));
-            if (!deleted) db.markReplica(fileId, s.agentId(), version, checksum);
+            if (!deleted) {
+                db.markReplica(fileId, s.agentId(), version, checksum);
+                // Lưu chunk manifest vào file_version_chunks nếu client gửi kèm
+                String manifestText = p.get("manifest");
+                if (manifestText != null && !manifestText.isBlank()) {
+                    ChunkManifest manifest = ChunkManifest.parse(manifestText);
+                    chunkStore.saveVersionChunks(fileId, version, manifest);
+                }
+            }
             db.logActivity(s.userId(), ws, action, path + " v" + version);
 
             Packet result = p.response(FILE_EVENT_RESULT).with("success", true).with("fileId", fileId)

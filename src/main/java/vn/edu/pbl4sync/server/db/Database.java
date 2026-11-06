@@ -106,7 +106,7 @@ public class Database implements AutoCloseable {
               base_version BIGINT NOT NULL,
               checksum VARCHAR(128),
               is_deleted BOOLEAN NOT NULL DEFAULT FALSE,
-              content LONGBLOB,
+              manifest TEXT,
               source_user_id BIGINT,
               source_device VARCHAR(180) NOT NULL DEFAULT '',
               operation VARCHAR(30) NOT NULL,
@@ -118,6 +118,27 @@ public class Database implements AutoCloseable {
             )
             """,
             """
+            CREATE TABLE IF NOT EXISTS chunks (
+              hash VARCHAR(64) NOT NULL,
+              size INT NOT NULL,
+              content LONGBLOB NOT NULL,
+              created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              PRIMARY KEY(hash)
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS file_version_chunks (
+              file_id BIGINT NOT NULL,
+              version BIGINT NOT NULL,
+              chunk_order INT NOT NULL,
+              chunk_hash VARCHAR(64) NOT NULL,
+              chunk_size INT NOT NULL,
+              PRIMARY KEY(file_id, version, chunk_order),
+              CONSTRAINT fk_fvc_file FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE,
+              CONSTRAINT fk_fvc_chunk FOREIGN KEY(chunk_hash) REFERENCES chunks(hash)
+            )
+            """,
+            """
             CREATE TABLE IF NOT EXISTS file_conflicts (
               id BIGINT PRIMARY KEY AUTO_INCREMENT,
               file_id BIGINT NULL,
@@ -126,7 +147,7 @@ public class Database implements AutoCloseable {
               base_version BIGINT NOT NULL,
               current_version BIGINT NOT NULL,
               checksum VARCHAR(128) NOT NULL,
-              content LONGBLOB NOT NULL,
+              manifest TEXT,
               source_user_id BIGINT,
               source_device VARCHAR(180) NOT NULL DEFAULT '',
               created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -926,6 +947,9 @@ public class Database implements AutoCloseable {
         for (int i = 0; i < kv.length; i += 2) m.put(String.valueOf(kv[i]), String.valueOf(kv[i + 1]));
         return m;
     }
+
+    /** Trả về connection pool để các store khác (ChunkStore) dùng chung. */
+    public SimpleConnectionPool pool() { return pool; }
 
     @Override public void close() { pool.close(); }
 }

@@ -240,20 +240,75 @@ public class AgentService implements AutoCloseable {
         }
 
         long baseVersion = state.uploadBaseVersion(ws, path);
-        Packet p = Packet.request(FILE_EVENT)
-                .with("workspaceId", ws)
-                .with("path", path)
-                .with("action", action)
-                .with("baseVersion", baseVersion);
 
         Packet r;
         if ("DELETE".equals(action)) {
+            // Xóa file: không cần chunk, gửi thẳng FILE_EVENT
+            Packet p = Packet.request(FILE_EVENT)
+                    .with("workspaceId", ws)
+                    .with("path", path)
+                    .with("action", action)
+                    .with("baseVersion", baseVersion);
             r = network.request(p, Duration.ofSeconds(30));
         } else {
+            // Tạo/sửa file: dùng CDC chunk protocol
             Path file = safeResolve(workspaceDir(workspace), path);
             if (!Files.isRegularFile(file))
                 return;
-            r = network.request(p, file, Duration.ofMinutes(5));
+
+            // Bước 1: Chunk file bằng Rabin CDC
+            List<RabinChunker.Chunk> chunks = RabinChunker.chunk(file);
+            long fileSize = Files.size(file);
+            ChunkManifest manifest = ChunkManifest.from(chunks, fileSize);
+            String manifestText = manifest.serialize();
+
+            // Bước 2: Gửi CHUNK_QUERY — hỏi server chunk nào còn thiếu
+            Packet queryPacket = Packet.request(CHUNK_QUERY)
+                    .with("workspaceId", ws)
+                    .with("path", path)
+                    .with("manifest", manifestText);
+            Packet queryResult = network.request(queryPacket, Duration.ofSeconds(30));
+            if (ERROR.equals(queryResult.type()))
+                throw new IllegalStateException("CHUNK_QUERY failed: " + queryResult.get("message"));
+
+            // Bước 3: Upload các chunk còn thiếu (delta upload)
+            String missingCsv = queryResult.get("missingHashes");
+            if (missingCsv != null && !missingCsv.isBlank()) {
+                Set<String> missing = new HashSet<>(Arrays.asList(missingCsv.split(",")));
+                for (RabinChunker.Chunk chunk : chunks) {
+                    if (!missing.contains(chunk.hash())) continue; // chunk đã có, bỏ qua
+                    byte[] data = RabinChunker.readChunk(file, chunk.offset(), chunk.length());
+                    // Ghi tạm ra file để dùng với network.request(payload)
+                    Path chunkTmp = Files.createTempFile("pbl4sync-chunk-", ".tmp");
+                    try {
+                        Files.write(chunkTmp, data);
+                        Packet uploadPacket = Packet.request(CHUNK_UPLOAD)
+                                .with("hash", chunk.hash())
+                                .with("size", chunk.length());
+                        Packet uploadResult = network.request(uploadPacket, chunkTmp,
+                                Duration.ofMinutes(2));
+                        if (ERROR.equals(uploadResult.type()))
+                            throw new IllegalStateException(
+                                    "CHUNK_UPLOAD failed for " + chunk.hash()
+                                            + ": " + uploadResult.get("message"));
+                    } finally {
+                        Files.deleteIfExists(chunkTmp);
+                    }
+                }
+            }
+
+            // Bước 4: Gửi FILE_EVENT kèm manifest — server lưu version
+            String checksum = HashUtil.sha256(file);
+            Packet p = Packet.request(FILE_EVENT)
+                    .with("workspaceId", ws)
+                    .with("path", path)
+                    .with("action", action)
+                    .with("baseVersion", baseVersion)
+                    .with("checksum", checksum)
+                    .with("size", fileSize)
+                    .with("manifest", manifestText);
+            // Gửi không có payload (server tái tạo từ chunk store)
+            r = network.request(p, Duration.ofSeconds(30));
         }
 
         if (ERROR.equals(r.type()))
