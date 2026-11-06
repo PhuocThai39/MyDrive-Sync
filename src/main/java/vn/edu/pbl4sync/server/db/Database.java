@@ -414,30 +414,29 @@ public class Database implements AutoCloseable {
             long version;
 
             if (existing == null) {
-                // A truly new path must be based on version 0. If the Agent claims it
-                // edited/deleted a version that the server does not have, do not guess.
-                if (baseVersion != 0) {
-                    if (!deleted) {
-                        saveConflict(c, null, workspaceId, path, baseVersion, 0, checksum,
-                                payload, userId, deviceName);
-                    }
+                // A truly new path must be based on version 0.
+                // If baseVersion != 0, the Agent edited a file the server doesn't know about —
+                // save it as a conflict copy (OneDrive-style) instead of rejecting.
+                if (baseVersion != 0 && !deleted) {
+                    String conflictPath = buildConflictPath(path, deviceName);
+                    long conflictId = insertNewFile(c, workspaceId, conflictPath, size, checksum, userId, deleted);
+                    insertFileVersion(c, conflictId, 1, baseVersion, checksum, deleted, payload,
+                            userId, deviceName, "CONFLICT", null);
+                    saveConflict(c, conflictId, workspaceId, path, baseVersion, 0, checksum,
+                            payload, userId, deviceName);
                     c.commit();
-                    return row("conflict", true, "current_version", 0, "current_checksum", "",
+                    return row("conflict", true,
+                            "conflict_path", conflictPath,
+                            "conflict_file_id", conflictId,
+                            "conflict_version", 1,
+                            "conflict_checksum", checksum,
+                            "conflict_size", size,
+                            "current_version", 0,
+                            "current_checksum", "",
                             "current_deleted", true);
                 }
 
-                try (PreparedStatement ps = c.prepareStatement(
-                        "INSERT INTO files(workspace_id,relative_path,size,checksum,version,modified_by,modified_at,deleted) VALUES(?,?,?,?,1,?,NOW(),?)",
-                        Statement.RETURN_GENERATED_KEYS)) {
-                    ps.setLong(1, workspaceId);
-                    ps.setString(2, path);
-                    ps.setLong(3, size);
-                    ps.setString(4, checksum);
-                    ps.setLong(5, userId);
-                    ps.setBoolean(6, deleted);
-                    ps.executeUpdate();
-                    try (ResultSet rs = ps.getGeneratedKeys()) { rs.next(); id = rs.getLong(1); }
-                }
+                id = insertNewFile(c, workspaceId, path, size, checksum, userId, deleted);
                 version = 1;
                 insertFileVersion(c, id, version, baseVersion, checksum, deleted, payload, userId,
                         deviceName, deleted ? "DELETE" : "UPDATE", null);
@@ -454,16 +453,23 @@ public class Database implements AutoCloseable {
                             "version", currentVersion, "deleted", deleted, "unchanged", true);
                 }
 
-                // Optimistic concurrency check: the Agent is only allowed to change
-                // exactly the version on which its local edit/delete was based.
-                if (baseVersion != currentVersion) {
-                    if (!deleted) {
-                        saveConflict(c, id, workspaceId, path, baseVersion, currentVersion, checksum,
-                                payload, userId, deviceName);
-                    }
+                // OneDrive-style conflict: baseVersion is stale (another machine already committed).
+                // Instead of rejecting, save the incoming content as a separate conflict-copy file.
+                if (baseVersion != currentVersion && !deleted) {
+                    String conflictPath = buildConflictPath(path, deviceName);
+                    long conflictId = insertNewFile(c, workspaceId, conflictPath, size, checksum, userId, false);
+                    insertFileVersion(c, conflictId, 1, baseVersion, checksum, false, payload,
+                            userId, deviceName, "CONFLICT", null);
+                    saveConflict(c, conflictId, workspaceId, path, baseVersion, currentVersion, checksum,
+                            payload, userId, deviceName);
                     c.commit();
                     return row(
                             "conflict", true,
+                            "conflict_path", conflictPath,
+                            "conflict_file_id", conflictId,
+                            "conflict_version", 1,
+                            "conflict_checksum", checksum,
+                            "conflict_size", size,
                             "id", id,
                             "current_version", currentVersion,
                             "current_checksum", currentChecksum,
@@ -507,6 +513,37 @@ public class Database implements AutoCloseable {
         } finally {
             try { c.setAutoCommit(true); } catch (SQLException ignored) { }
             pool.release(c);
+        }
+    }
+
+    /** Builds an OneDrive-style conflict path, e.g. report.docx → report_conflict_LaptopA_20261106_084532.docx */
+    private static String buildConflictPath(String originalPath, String deviceName) {
+        String stamp = java.time.LocalDateTime.now()
+                .format(java.time.format.DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss"));
+        String safeDev = (deviceName == null || deviceName.isBlank() ? "unknown"
+                : deviceName.replaceAll("[^A-Za-z0-9_-]", "_"));
+        int dot = originalPath.lastIndexOf('.');
+        if (dot > 0 && dot > originalPath.lastIndexOf('/')) {
+            return originalPath.substring(0, dot) + "_conflict_" + safeDev + "_" + stamp
+                    + originalPath.substring(dot);
+        }
+        return originalPath + "_conflict_" + safeDev + "_" + stamp;
+    }
+
+    /** Inserts a new row in the files table and returns the generated id. */
+    private long insertNewFile(Connection c, long workspaceId, String path, long size,
+                               String checksum, long userId, boolean deleted) throws SQLException {
+        try (PreparedStatement ps = c.prepareStatement(
+                "INSERT INTO files(workspace_id,relative_path,size,checksum,version,modified_by,modified_at,deleted) VALUES(?,?,?,?,1,?,NOW(),?)",
+                Statement.RETURN_GENERATED_KEYS)) {
+            ps.setLong(1, workspaceId);
+            ps.setString(2, path);
+            ps.setLong(3, size);
+            ps.setString(4, checksum);
+            ps.setLong(5, userId);
+            ps.setBoolean(6, deleted);
+            ps.executeUpdate();
+            try (ResultSet rs = ps.getGeneratedKeys()) { rs.next(); return rs.getLong(1); }
         }
     }
 
