@@ -68,11 +68,22 @@ class DatabaseVersionHistoryTest {
 
         assertEquals("true", result.get("conflict"));
         assertEquals("1", database.findFile(workspaceId, "a1.txt").get("version"));
+        Map<String, String> duplicate = database.applyFileChange(workspaceId, "a1.txt",
+                Files.size(conflict), HashUtil.sha256(conflict), userId, "Client2",
+                0, false, conflict);
+        assertEquals(result.get("conflict_path"), duplicate.get("conflict_path"));
+
         assertEquals(1, database.listFileVersions(Long.parseLong(initial.get("id"))).size());
         try (var connection = DriverManager.getConnection(url, "sa", "");
              var statement = connection.createStatement();
-             var rows = statement.executeQuery("SELECT content FROM file_conflicts WHERE file_id="
-                     + initial.get("id"))) {
+             var rows = statement.executeQuery("SELECT COUNT(*) FROM file_conflicts WHERE workspace_id="
+                     + workspaceId + " AND relative_path='a1.txt'")) {
+            assertTrue(rows.next());
+            assertEquals(1, rows.getInt(1));
+        }
+        try (var connection = DriverManager.getConnection(url, "sa", "");
+             var statement = connection.createStatement();
+             var rows = statement.executeQuery("SELECT content FROM file_conflicts WHERE relative_path='a1.txt'")) {
             assertTrue(rows.next());
             assertEquals("client-stale", new String(rows.getBytes(1)));
         }

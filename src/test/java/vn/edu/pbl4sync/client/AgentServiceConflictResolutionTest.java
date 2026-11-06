@@ -136,6 +136,50 @@ class AgentServiceConflictResolutionTest {
         }
     }
 
+    @Test
+    void repeatedAuthoritativeDeliveryDoesNotCreateConflictCopiesForCleanFile() throws Exception {
+        Path syncRoot = temp.resolve("CompanySync");
+        ClientConfig config = new ClientConfig(temp.resolve("client.properties"));
+        config.setSyncRoot(syncRoot);
+
+        try (AgentService service = new AgentService(config)) {
+            Path original = syncRoot.resolve("7_bin").resolve("bintest.txt");
+            Files.createDirectories(original.getParent());
+            Files.writeString(original, "server winning version");
+            String checksum = HashUtil.sha256(original);
+
+            LocalStateStore state = new LocalStateStore(syncRoot);
+            state.put(7, "bintest.txt", 3, checksum);
+            setField(service, "state", state);
+            setField(service, "workspaces", List.of(Map.of("id", "7", "name", "bin")));
+
+            Path incoming = temp.resolve("winner.txt");
+            Files.writeString(incoming, "server winning version");
+            Packet delivery = Packet.event(FILE_DELIVER)
+                    .with("workspaceId", 7)
+                    .with("path", "bintest.txt")
+                    .with("version", 3)
+                    .with("checksum", checksum)
+                    .with("authoritative", true)
+                    .with("fileId", 11);
+            Method apply = AgentService.class.getDeclaredMethod("applyDeliveredFile", Packet.class, Path.class);
+            apply.setAccessible(true);
+
+            for (int i = 0; i < 2; i++) {
+                assertThrows(java.lang.reflect.InvocationTargetException.class,
+                        () -> apply.invoke(service, delivery, incoming));
+            }
+
+            Path conflictRoot = syncRoot.resolve(".pbl4sync").resolve("conflicts").resolve("7");
+            if (Files.exists(conflictRoot)) {
+                try (var files = Files.walk(conflictRoot)) {
+                    assertEquals(0, files.filter(Files::isRegularFile).count());
+                }
+            }
+            assertEquals("server winning version", Files.readString(original));
+        }
+    }
+
     private static void setField(Object target, String name, Object value) throws Exception {
         Field field = target.getClass().getDeclaredField(name);
         field.setAccessible(true);

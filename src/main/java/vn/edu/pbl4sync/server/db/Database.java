@@ -418,6 +418,20 @@ public class Database implements AutoCloseable {
                 // If baseVersion != 0, the Agent edited a file the server doesn't know about —
                 // save it as a conflict copy (OneDrive-style) instead of rejecting.
                 if (baseVersion != 0 && !deleted) {
+                    Map<String, String> duplicate = findDuplicateConflict(c, workspaceId, path,
+                            baseVersion, 0, checksum, userId, deviceName);
+                    if (duplicate != null) {
+                        c.commit();
+                        return row("conflict", true,
+                                "conflict_path", duplicate.get("conflict_path"),
+                                "conflict_file_id", duplicate.get("conflict_file_id"),
+                                "conflict_version", duplicate.get("conflict_version"),
+                                "conflict_checksum", duplicate.get("conflict_checksum"),
+                                "conflict_size", duplicate.get("conflict_size"),
+                                "current_version", 0,
+                                "current_checksum", "",
+                                "current_deleted", true);
+                    }
                     String conflictPath = buildConflictPath(path, deviceName);
                     long conflictId = insertNewFile(c, workspaceId, conflictPath, size, checksum, userId, deleted);
                     insertFileVersion(c, conflictId, 1, baseVersion, checksum, deleted, payload,
@@ -456,6 +470,22 @@ public class Database implements AutoCloseable {
                 // OneDrive-style conflict: baseVersion is stale (another machine already committed).
                 // Instead of rejecting, save the incoming content as a separate conflict-copy file.
                 if (baseVersion != currentVersion && !deleted) {
+                    Map<String, String> duplicate = findDuplicateConflict(c, workspaceId, path,
+                            baseVersion, currentVersion, checksum, userId, deviceName);
+                    if (duplicate != null) {
+                        c.commit();
+                        return row("conflict", true,
+                                "conflict_path", duplicate.get("conflict_path"),
+                                "conflict_file_id", duplicate.get("conflict_file_id"),
+                                "conflict_version", duplicate.get("conflict_version"),
+                                "conflict_checksum", duplicate.get("conflict_checksum"),
+                                "conflict_size", duplicate.get("conflict_size"),
+                                "id", id,
+                                "current_version", currentVersion,
+                                "current_checksum", currentChecksum,
+                                "current_deleted", currentDeleted,
+                                "current_size", existing.getOrDefault("size", "0"));
+                    }
                     String conflictPath = buildConflictPath(path, deviceName);
                     long conflictId = insertNewFile(c, workspaceId, conflictPath, size, checksum, userId, false);
                     insertFileVersion(c, conflictId, 1, baseVersion, checksum, false, payload,
@@ -519,15 +549,33 @@ public class Database implements AutoCloseable {
     /** Builds an OneDrive-style conflict path, e.g. report.docx → report_conflict_LaptopA_20261106_084532.docx */
     private static String buildConflictPath(String originalPath, String deviceName) {
         String stamp = java.time.LocalDateTime.now()
-                .format(java.time.format.DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss"));
+                .format(java.time.format.DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss_SSS"));
         String safeDev = (deviceName == null || deviceName.isBlank() ? "unknown"
                 : deviceName.replaceAll("[^A-Za-z0-9_-]", "_"));
+        String uniqueSuffix = java.util.UUID.randomUUID().toString().substring(0, 8);
         int dot = originalPath.lastIndexOf('.');
         if (dot > 0 && dot > originalPath.lastIndexOf('/')) {
-            return originalPath.substring(0, dot) + "_conflict_" + safeDev + "_" + stamp
+            return originalPath.substring(0, dot) + "_conflict_" + safeDev + "_" + stamp + "_" + uniqueSuffix
                     + originalPath.substring(dot);
         }
-        return originalPath + "_conflict_" + safeDev + "_" + stamp;
+        return originalPath + "_conflict_" + safeDev + "_" + stamp + "_" + uniqueSuffix;
+    }
+
+    private Map<String, String> findDuplicateConflict(Connection c, long workspaceId, String path,
+                                                       long baseVersion, long currentVersion, String checksum,
+                                                       long userId, String deviceName) throws SQLException {
+        return queryOne(c, """
+                SELECT f.id AS conflict_file_id, f.relative_path AS conflict_path,
+                       f.version AS conflict_version, f.checksum AS conflict_checksum,
+                       f.size AS conflict_size
+                FROM file_conflicts fc
+                JOIN files f ON f.id=fc.file_id
+                WHERE fc.workspace_id=? AND fc.relative_path=? AND fc.base_version=?
+                  AND fc.current_version=? AND fc.checksum=? AND fc.source_user_id=?
+                  AND fc.source_device=?
+                ORDER BY fc.id DESC LIMIT 1 FOR UPDATE
+                """, workspaceId, path, baseVersion, currentVersion, checksum, userId,
+                deviceName == null ? "" : deviceName);
     }
 
     /** Inserts a new row in the files table and returns the generated id. */

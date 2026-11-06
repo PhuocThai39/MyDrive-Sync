@@ -23,6 +23,8 @@ public class AgentService implements AutoCloseable {
     private final Map<Long, FolderWatcher> watchers = new ConcurrentHashMap<>();
     private final Set<String> pendingDeferredSync = ConcurrentHashMap.newKeySet();
     private final Set<String> pendingLocalUploadRetry = ConcurrentHashMap.newKeySet();
+    private final Set<String> uploadsInProgress = ConcurrentHashMap.newKeySet();
+    private final Map<String, String> pendingUploadActions = new ConcurrentHashMap<>();
     private final Set<String> suppressedWarnings = ConcurrentHashMap.newKeySet();
     private volatile List<Map<String, String>> workspaces = new ArrayList<>();
     private volatile LocalStateStore state;
@@ -231,6 +233,49 @@ public class AgentService implements AutoCloseable {
     }
 
     private void uploadLocalChange(long ws, String path, String action) throws Exception {
+        String uploadKey = ws + ":" + path;
+        synchronized (uploadsInProgress) {
+            if (!uploadsInProgress.add(uploadKey)) {
+                pendingUploadActions.put(uploadKey, action);
+                return;
+            }
+        }
+        boolean completed = false;
+        try {
+            String nextAction = action;
+            while (true) {
+                uploadLocalChangeOnce(ws, path, nextAction);
+                synchronized (uploadsInProgress) {
+                    nextAction = pendingUploadActions.remove(uploadKey);
+                    if (nextAction == null) {
+                        uploadsInProgress.remove(uploadKey);
+                        completed = true;
+                        return;
+                    }
+                }
+            }
+        } finally {
+            if (!completed) {
+                String pendingAction;
+                synchronized (uploadsInProgress) {
+                    uploadsInProgress.remove(uploadKey);
+                    pendingAction = pendingUploadActions.remove(uploadKey);
+                }
+                if (pendingAction != null && !workers.isShutdown()) {
+                    String retryAction = pendingAction;
+                    workers.submit(() -> {
+                        try {
+                            uploadLocalChange(ws, path, retryAction);
+                        } catch (Exception e) {
+                            notify("ERROR", retryAction + " " + path + " failed: " + e.getMessage());
+                        }
+                    });
+                }
+            }
+        }
+    }
+
+    private void uploadLocalChangeOnce(long ws, String path, String action) throws Exception {
         Map<String, String> workspace = workspace(ws);
         if (workspace == null)
             return;
@@ -301,6 +346,18 @@ public class AgentService implements AutoCloseable {
             return;
 
         Files.createDirectories(conflictFile.getParent());
+        String localChecksum = HashUtil.sha256(localFile);
+        if (Files.exists(conflictFile)) {
+            if (!Files.isRegularFile(conflictFile)
+                    || !Objects.equals(HashUtil.sha256(conflictFile), localChecksum)) {
+                throw new IllegalStateException("Conflict-copy path already contains different content: "
+                        + conflictPath);
+            }
+            ignore.ignore(localFile, 3000);
+            Files.delete(localFile);
+            state.put(ws, conflictPath, version, localChecksum);
+            return;
+        }
         ignore.ignore(localFile, 3000);
         ignore.ignore(conflictFile, 3000);
         try {
@@ -426,7 +483,9 @@ public class AgentService implements AutoCloseable {
                     scheduleDeferredSync(ws + ":" + conflictRel, conflictRel);
                     return;
                 }
-                if (incomingVersion > knownVersion && !Objects.equals(localChecksum, remoteChecksum))
+                if (incomingVersion > knownVersion
+                        && !Objects.equals(localChecksum, remoteChecksum)
+                        && isLocalDirty(ws, conflictRel, conflictTarget))
                     createConflictCopy(ws, conflictRel, conflictTarget);
             }
             Files.createDirectories(conflictTarget.getParent());
@@ -498,7 +557,7 @@ public class AgentService implements AutoCloseable {
                 && !dirty
                 && !Objects.equals(localChecksum, remoteChecksum)
                 ? knownVersion : -1;
-        boolean conflict = authoritative || dirty;
+        boolean conflict = dirty;
         if (conflict && Files.isRegularFile(target)) {
             createConflictCopy(ws, rel, target);
             warnOnce("conflict-local:" + ws + ":" + rel,
@@ -758,9 +817,17 @@ public class AgentService implements AutoCloseable {
         String stamp = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss_SSS"));
         String device = config.deviceName().replaceAll("[^a-zA-Z0-9_-]", "_");
 
-        Path conflict = logicalTarget.resolveSibling(base + "_conflict_" + device + "_" + stamp + ext);
-        Files.copy(source, conflict, StandardCopyOption.REPLACE_EXISTING);
-        return conflict;
+        String conflictBase = base + "_conflict_" + device + "_" + stamp;
+        for (int suffix = 0; ; suffix++) {
+            String numberedBase = suffix == 0 ? conflictBase : conflictBase + "_" + suffix;
+            Path conflict = logicalTarget.resolveSibling(numberedBase + ext);
+            try {
+                Files.copy(source, conflict);
+                return conflict;
+            } catch (FileAlreadyExistsException e) {
+                // Preserve both snapshots when multiple conflicts happen in the same millisecond.
+            }
+        }
     }
 
     private void saveBackupEvent(Packet packet, Path payload) throws Exception {
