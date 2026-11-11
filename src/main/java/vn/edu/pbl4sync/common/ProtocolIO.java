@@ -56,7 +56,7 @@ public final class ProtocolIO {
         if (payloadLength < 0) throw new IOException("Invalid payload length");
 
         Path temp = null;
-        if (payloadLength > 0) {
+        if (payloadLength > 0 || requiresPayloadFile(packet)) {
             temp = Files.createTempFile("pbl4sync-payload-", ".tmp");
             try (OutputStream fileOut = new BufferedOutputStream(Files.newOutputStream(temp,
                     StandardOpenOption.TRUNCATE_EXISTING))) {
@@ -75,6 +75,17 @@ public final class ProtocolIO {
             }
         }
         return new ReceivedPacket(packet, temp, payloadLength);
+    }
+
+    private static boolean requiresPayloadFile(Packet packet) {
+        return switch (packet.type()) {
+            case MessageTypes.FILE_DELIVER, MessageTypes.FILE_RELAY_UPLOAD -> true;
+            case MessageTypes.FILE_EVENT -> {
+                String action = packet.get("action");
+                yield "CREATE".equalsIgnoreCase(action) || "MODIFY".equalsIgnoreCase(action);
+            }
+            default -> false;
+        };
     }
 
     private static byte[] encode(Packet packet) throws IOException {
