@@ -6,8 +6,6 @@ import vn.edu.pbl4sync.common.*;
 import java.awt.Desktop;
 import java.nio.file.*;
 import java.time.Duration;
-import java.time.LocalDateTime;
-import java.time.format.DateTimeFormatter;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.function.BiConsumer;
@@ -352,7 +350,7 @@ public class AgentService implements AutoCloseable {
             Files.createDirectories(target.getParent());
             String key = "conflict-remote:" + ws + ":" + rel;
             if (Files.isRegularFile(target)) {
-                createConflictCopy(ws, rel, target);
+                createConflictCopy(ws, rel, target, incomingVersion);
                 warnOnce(key, "Conflict detected for " + rel
                         + ": local version is newer or different from server. A conflict copy was saved.");
             } else {
@@ -367,7 +365,7 @@ public class AgentService implements AutoCloseable {
         boolean dirty = Files.isRegularFile(target) && isLocalDirty(ws, rel, target);
         boolean conflict = p.getBoolean("conflict", false) || dirty;
         if (conflict && Files.isRegularFile(target)) {
-            createConflictCopy(ws, rel, target);
+            createConflictCopy(ws, rel, target, incomingVersion);
             warnOnce("conflict-local:" + ws + ":" + rel,
                     "Conflict copy created for " + rel
                             + ". Local changes were preserved and the server version is waiting for resolution.");
@@ -390,7 +388,6 @@ public class AgentService implements AutoCloseable {
                     scheduleDeferredSync(key, rel);
                     return;
                 }
-                createConflictCopy(ws, rel, target);
                 warnOnce(key, "Conflict detected for " + rel
                         + ". Local changes were preserved. The server version remains authoritative until resolved.");
                 scheduleLocalUploadRetry(key, ws, rel);
@@ -428,7 +425,7 @@ public class AgentService implements AutoCloseable {
 
         Path target = safeResolve(workspaceDir(workspace), rel);
         if (Files.isRegularFile(target) && isLocalDirty(ws, rel, target)) {
-            Path conflictCopy = createConflictCopy(ws, rel, target);
+            Path conflictCopy = createConflictCopy(ws, rel, target, incomingVersion);
             notify("WARN", "Unsynced local changes preserved before remote delete: " + conflictCopy);
         }
 
@@ -577,7 +574,8 @@ public class AgentService implements AutoCloseable {
         return !Objects.equals(currentChecksum, knownChecksum);
     }
 
-    private Path createConflictCopy(long workspaceId, String relativePath, Path source) throws Exception {
+    private Path createConflictCopy(long workspaceId, String relativePath, Path source, long serverVersion)
+            throws Exception {
         Path conflictRoot = config.syncRoot()
                 .resolve(".pbl4sync")
                 .resolve("conflicts")
@@ -591,10 +589,11 @@ public class AgentService implements AutoCloseable {
         int dot = name.lastIndexOf('.');
         String base = dot > 0 ? name.substring(0, dot) : name;
         String ext = dot > 0 ? name.substring(dot) : "";
-        String stamp = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss_SSS"));
         String device = config.deviceName().replaceAll("[^a-zA-Z0-9_-]", "_");
+        String localChecksum = HashUtil.sha256(source).substring(0, 12);
 
-        Path conflict = logicalTarget.resolveSibling(base + "_conflict_" + device + "_" + stamp + ext);
+        Path conflict = logicalTarget.resolveSibling(
+                base + "_conflict_" + device + "_v" + serverVersion + "_" + localChecksum + ext);
         Files.copy(source, conflict, StandardCopyOption.REPLACE_EXISTING);
         return conflict;
     }
