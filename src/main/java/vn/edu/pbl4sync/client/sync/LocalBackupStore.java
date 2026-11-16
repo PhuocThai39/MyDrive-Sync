@@ -4,7 +4,6 @@ import vn.edu.pbl4sync.common.ChunkManifest;
 import vn.edu.pbl4sync.common.RabinChunker;
 
 import java.io.IOException;
-import java.nio.charset.StandardCharsets;
 import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
@@ -12,40 +11,48 @@ import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.nio.file.attribute.BasicFileAttributes;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
+import java.net.InetAddress;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Comparator;
-import java.util.HexFormat;
 import java.util.List;
-import java.util.Locale;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.function.LongFunction;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /** Local manifest archive with one verified full copy for the latest archived version. */
 public final class LocalBackupStore {
-    private static final DateTimeFormatter TIMESTAMP = DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss_SSS")
+    private static final DateTimeFormatter TIMESTAMP = DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss")
             .withZone(ZoneOffset.UTC);
-    private static final Pattern MANIFEST_NAME = Pattern.compile("^(.+)_v([0-9]{20})_([0-9]{8}_[0-9]{6}_[0-9]{3})\\.manifest$");
-    private static final HexFormat HEX = HexFormat.of();
+    private static final Pattern MANIFEST_NAME = Pattern.compile("^(.+)_v([0-9]+)_([0-9]{8}_[0-9]{6})\\.manifest$");
 
     private final Path syncRoot;
     private final Path backupRoot;
+    private final LongFunction<String> workspaceNameResolver;
 
     /** Places BackUp beside the sync root so it cannot be picked up by sync scanning. */
     public LocalBackupStore(Path syncRoot) {
-        this(syncRoot, defaultBackupRoot(syncRoot));
+        this(syncRoot, defaultBackupRoot(syncRoot, null), ignored -> null);
     }
 
     /** Allows an explicit external backup location, rejecting a path inside syncRoot. */
     public LocalBackupStore(Path syncRoot, Path backupRoot) {
+        this(syncRoot, backupRoot, ignored -> null);
+    }
+
+    /** Uses the configured device name and resolves readable workspace names by their IDs. */
+    public LocalBackupStore(Path syncRoot, String deviceName, LongFunction<String> workspaceNameResolver) {
+        this(syncRoot, defaultBackupRoot(syncRoot, deviceName), workspaceNameResolver);
+    }
+
+    private LocalBackupStore(Path syncRoot, Path backupRoot, LongFunction<String> workspaceNameResolver) {
         this.syncRoot = normalize(syncRoot, "syncRoot");
         this.backupRoot = normalize(backupRoot, "backupRoot");
+        this.workspaceNameResolver = Objects.requireNonNull(workspaceNameResolver, "workspaceNameResolver");
         if (this.backupRoot.startsWith(this.syncRoot)) {
             throw new IllegalArgumentException("BackUp directory must be outside the sync root");
         }
@@ -61,7 +68,7 @@ public final class LocalBackupStore {
 
         Path directory = fileDirectory(workspaceId, normalizedRelativePath);
         Files.createDirectories(directory);
-        String displayName = safeFileName(source.getFileName().toString());
+        String displayName = safeFileName(fileName(normalizedRelativePath));
 
         Path snapshot = Files.createTempFile(directory, ".backup-capture-", ".tmp");
         Path stagedManifest = null;
@@ -91,7 +98,7 @@ public final class LocalBackupStore {
             long latestVersion = existing.stream().mapToLong(BackupVersion::version).max().orElse(-1);
             boolean shouldKeepFullCopy = version >= latestVersion;
             String timestamp = TIMESTAMP.format(Instant.now());
-            String stem = displayName + "_v" + String.format(Locale.ROOT, "%020d", version) + "_" + timestamp;
+            String stem = displayName + "_v" + version + "_" + timestamp;
             Path manifestPath = directory.resolve(stem + ".manifest");
             Path fullCopyPath = shouldKeepFullCopy ? directory.resolve(stem + ".full") : null;
             stagedManifest = Files.createTempFile(directory, ".backup-manifest-", ".tmp");
@@ -102,7 +109,7 @@ public final class LocalBackupStore {
             if (shouldKeepFullCopy) {
                 moveReplacing(snapshot, fullCopyPath);
                 snapshotMoved = true;
-                removeOlderFullCopies(directory, fullCopyPath);
+                removeOlderFullCopies(directory, displayName, fullCopyPath);
             }
 
             return new BackupVersion(workspaceId, normalizedRelativePath, version,
@@ -157,6 +164,7 @@ public final class LocalBackupStore {
             for (Path manifestPath : stream) {
                 Matcher matcher = MANIFEST_NAME.matcher(manifestPath.getFileName().toString());
                 if (!matcher.matches()) throw new IOException("Invalid backup manifest filename: " + manifestPath.getFileName());
+                if (!safeFileName(fileName(normalizedRelativePath)).equals(matcher.group(1))) continue;
                 long version;
                 try {
                     version = Long.parseLong(matcher.group(2));
@@ -215,18 +223,31 @@ public final class LocalBackupStore {
         return backupRoot;
     }
 
-    private static Path defaultBackupRoot(Path syncRoot) {
+    private static Path defaultBackupRoot(Path syncRoot, String configuredDeviceName) {
         Path normalized = normalize(syncRoot, "syncRoot");
         Path parent = normalized.getParent();
         if (parent == null) {
             throw new IllegalArgumentException("A volume-root sync directory needs an explicit external BackUp path");
         }
-        return parent.resolve("BackUp").resolve(sha256(normalized.toString()));
+        String deviceName = firstNonBlank(configuredDeviceName,
+                System.getenv("COMPUTERNAME"), localHostName(), "unknown-device");
+        return parent.resolve("BackUp").resolve(safeFileSystemSegment(deviceName));
     }
 
     private Path fileDirectory(long workspaceId, String relativePath) {
-        return backupRoot.resolve("workspace-" + workspaceId)
-                .resolve(sha256(workspaceId + "|" + relativePath));
+        String workspaceName = workspaceNameResolver.apply(workspaceId);
+        if (workspaceName == null || workspaceName.isBlank()) workspaceName = String.valueOf(workspaceId);
+        Path directory = backupRoot.resolve("workspace-" + safeFileSystemSegment(workspaceName));
+        Path relative = Path.of(relativePath);
+        Path parent = relative.getParent();
+        if (parent != null) {
+            for (Path segment : parent) directory = directory.resolve(safeFileSystemSegment(segment.toString()));
+        }
+        Path normalizedDirectory = directory.normalize();
+        if (!normalizedDirectory.startsWith(backupRoot)) {
+            throw new IllegalArgumentException("Backup path escapes the backup root");
+        }
+        return normalizedDirectory;
     }
 
     private ChunkManifest readManifestFile(Path path) throws IOException {
@@ -262,10 +283,14 @@ public final class LocalBackupStore {
         }
     }
 
-    private void removeOlderFullCopies(Path directory, Path keep) {
+    private void removeOlderFullCopies(Path directory, String displayName, Path keep) {
         try (DirectoryStream<Path> stream = Files.newDirectoryStream(directory, "*.full")) {
             for (Path candidate : stream) {
-                if (!candidate.equals(keep)) {
+                String name = candidate.getFileName().toString();
+                Matcher matcher = name.endsWith(".full")
+                        ? MANIFEST_NAME.matcher(name.substring(0, name.length() - ".full".length()) + ".manifest")
+                        : MANIFEST_NAME.matcher("");
+                if (!candidate.equals(keep) && matcher.matches() && displayName.equals(matcher.group(1))) {
                     try { Files.deleteIfExists(candidate); } catch (IOException ignored) { }
                 }
             }
@@ -305,20 +330,35 @@ public final class LocalBackupStore {
     }
 
     private String safeFileName(String fileName) {
-        String safe = fileName.replaceAll("[^\\p{L}\\p{N}._ -]", "_").trim();
-        return safe.isBlank() || safe.equals(".") || safe.equals("..") ? "file" : safe;
+        return safeFileSystemSegment(fileName);
+    }
+
+    private String fileName(String relativePath) {
+        Path name = Path.of(relativePath).getFileName();
+        return name == null ? "file" : name.toString();
+    }
+
+    private static String safeFileSystemSegment(String value) {
+        String safe = value.replaceAll("[^\\p{L}\\p{N}._ -]", "_").trim();
+        while (safe.endsWith(".")) safe = safe.substring(0, safe.length() - 1);
+        if (safe.isBlank() || safe.equals(".") || safe.equals("..")) safe = "item";
+        String stem = safe.contains(".") ? safe.substring(0, safe.indexOf('.')) : safe;
+        if (stem.matches("(?i)CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9]")) safe = "_" + safe;
+        return safe;
+    }
+
+    private static String firstNonBlank(String... values) {
+        for (String value : values) if (value != null && !value.isBlank()) return value;
+        return "unknown-device";
+    }
+
+    private static String localHostName() {
+        try { return InetAddress.getLocalHost().getHostName(); }
+        catch (Exception ignored) { return null; }
     }
 
     private static Path normalize(Path path, String label) {
         return Objects.requireNonNull(path, label).toAbsolutePath().normalize();
-    }
-
-    private static String sha256(String value) {
-        try {
-            return HEX.formatHex(MessageDigest.getInstance("SHA-256").digest(value.getBytes(StandardCharsets.UTF_8)));
-        } catch (NoSuchAlgorithmException e) {
-            throw new IllegalStateException("Java runtime does not provide SHA-256", e);
-        }
     }
 
     public record BackupVersion(long workspaceId, String relativePath, long version, String createdAt,

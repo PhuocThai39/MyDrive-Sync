@@ -62,7 +62,7 @@ public class AgentService implements AutoCloseable {
         this.systemRole = r.get("systemRole");
         Files.createDirectories(config.syncRoot());
         this.state = new LocalStateStore(config.syncRoot());
-        this.localBackupStore = new LocalBackupStore(config.syncRoot());
+        this.localBackupStore = new LocalBackupStore(config.syncRoot(), config.deviceName(), this::workspaceName);
         refreshWorkspaces();
         startWatchers();
         workers.submit(() -> {
@@ -837,6 +837,11 @@ public class AgentService implements AutoCloseable {
             if (parseLong(w.get("id"), -1) == id)
                 return w;
         return null;
+    }
+
+    private String workspaceName(long id) {
+        Map<String, String> w = workspace(id);
+        return w == null ? null : w.get("name");
     }
 
     private Path safeResolve(Path root, String rel) {
