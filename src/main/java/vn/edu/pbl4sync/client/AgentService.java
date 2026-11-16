@@ -4,7 +4,9 @@ import vn.edu.pbl4sync.client.sync.*;
 import vn.edu.pbl4sync.common.*;
 
 import java.awt.Desktop;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
+import java.security.MessageDigest;
 import java.time.Duration;
 import java.util.*;
 import java.util.concurrent.*;
@@ -15,6 +17,7 @@ import static vn.edu.pbl4sync.common.MessageTypes.*;
 public class AgentService implements AutoCloseable {
     private final ClientConfig config;
     private final NetworkClient network = new NetworkClient();
+    private final Object chunkUploadLock = new Object();
     private final ExecutorService workers = Executors.newFixedThreadPool(6);
     private final ScheduledExecutorService syncScheduler = Executors.newSingleThreadScheduledExecutor();
     private final IgnoreRegistry ignore = new IgnoreRegistry();
@@ -24,6 +27,7 @@ public class AgentService implements AutoCloseable {
     private final Set<String> suppressedWarnings = ConcurrentHashMap.newKeySet();
     private volatile List<Map<String, String>> workspaces = new ArrayList<>();
     private volatile LocalStateStore state;
+    private volatile LocalBackupStore localBackupStore;
     private volatile BiConsumer<String, String> notificationListener = (l, m) -> {
     };
     private long userId;
@@ -57,6 +61,7 @@ public class AgentService implements AutoCloseable {
         this.systemRole = r.get("systemRole");
         Files.createDirectories(config.syncRoot());
         this.state = new LocalStateStore(config.syncRoot());
+        this.localBackupStore = new LocalBackupStore(config.syncRoot());
         refreshWorkspaces();
         startWatchers();
         workers.submit(() -> {
@@ -232,7 +237,9 @@ public class AgentService implements AutoCloseable {
             Path file = safeResolve(workspaceDir(workspace), path);
             if (!Files.isRegularFile(file))
                 return;
-            r = network.request(p, file, Duration.ofMinutes(5));
+            synchronized (chunkUploadLock) {
+                r = uploadChunkedFile(p, file);
+            }
         }
 
         if (ERROR.equals(r.type()))
@@ -258,6 +265,103 @@ public class AgentService implements AutoCloseable {
             state.put(ws, path, newVersion, r.get("checksum"));
         }
         notify("INFO", path + " synchronized (v" + newVersion + ")");
+    }
+
+    private Packet uploadChunkedFile(Packet fileEvent, Path file) throws Exception {
+        long size = Files.size(file);
+        List<RabinChunker.Chunk> chunks = RabinChunker.chunk(file);
+        ChunkManifest manifest = ChunkManifest.from(chunks, size);
+        String checksum = HashUtil.sha256(file);
+        String manifestText = manifest.serialize();
+        if (manifestText.getBytes(StandardCharsets.UTF_8).length > 4 * 1024 * 1024 - 1024) {
+            throw new IllegalArgumentException("Manifest exceeds the 4 MiB protocol header limit");
+        }
+
+        Packet query = Packet.request(CHUNK_QUERY)
+                .with("workspaceId", fileEvent.get("workspaceId"))
+                .with("path", fileEvent.get("path"))
+                .with("action", fileEvent.get("action"))
+                .with("checksum", checksum)
+                .with("size", size)
+                .with("baseVersion", fileEvent.get("baseVersion"))
+                .with("manifest", manifestText);
+        Packet queryResult = network.request(query, Duration.ofMinutes(2));
+        if (ERROR.equals(queryResult.type())) throw new IllegalStateException(queryResult.get("message"));
+        if (!CHUNK_QUERY_RESULT.equals(queryResult.type())) {
+            throw new IllegalStateException("Unexpected CHUNK_QUERY response: " + queryResult.type());
+        }
+
+        Map<String, RabinChunker.Chunk> chunksByHash = new HashMap<>();
+        for (RabinChunker.Chunk chunk : chunks) chunksByHash.putIfAbsent(chunk.hash(), chunk);
+        Set<String> missingHashes = parseMissingHashes(queryResult.get("missingHashes"));
+        for (String hash : missingHashes) {
+            RabinChunker.Chunk chunk = chunksByHash.get(hash);
+            if (chunk == null) throw new IllegalStateException("Server requested a hash absent from the manifest: " + hash);
+            byte[] content = RabinChunker.readChunk(file, chunk.offset(), chunk.length());
+            if (!hash.equals(sha256(content))) {
+                throw new IllegalStateException("File changed while uploading chunk " + hash);
+            }
+
+            Path payload = Files.createTempFile("pbl4sync-upload-chunk-", ".tmp");
+            try {
+                Files.write(payload, content, StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE);
+                Packet upload = Packet.request(CHUNK_UPLOAD).with("hash", hash).with("size", chunk.length());
+                Packet uploadResult = network.request(upload, payload, Duration.ofMinutes(5));
+                if (ERROR.equals(uploadResult.type())) throw new IllegalStateException(uploadResult.get("message"));
+                if (!OK.equals(uploadResult.type())) {
+                    throw new IllegalStateException("Unexpected CHUNK_UPLOAD response: " + uploadResult.type());
+                }
+            } finally {
+                Files.deleteIfExists(payload);
+            }
+        }
+
+        if (Files.size(file) != size || !checksum.equals(HashUtil.sha256(file))) {
+            throw new IllegalStateException("File changed during chunk upload; retry after the file is stable");
+        }
+        fileEvent.with("checksum", checksum).with("size", size).with("manifest", manifestText);
+        Packet result = network.request(fileEvent, Duration.ofMinutes(5));
+        if (ERROR.equals(result.type())) throw new IllegalStateException(result.get("message"));
+        if (!FILE_EVENT_RESULT.equals(result.type())) {
+            throw new IllegalStateException("Unexpected FILE_EVENT response: " + result.type());
+        }
+        return result;
+    }
+
+    private Set<String> parseMissingHashes(String csv) {
+        if (csv == null || csv.isBlank()) return Set.of();
+        Set<String> hashes = new LinkedHashSet<>();
+        for (String value : csv.split(",", -1)) {
+            if (!value.matches("[0-9a-fA-F]{64}")) {
+                throw new IllegalStateException("Server returned an invalid missing chunk hash");
+            }
+            hashes.add(value.toLowerCase(Locale.ROOT));
+        }
+        return hashes;
+    }
+
+    private String sha256(byte[] content) throws Exception {
+        return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(content));
+    }
+
+    /** Requests a server-side rollback; the resulting FILE_DELIVER/FILE_DELETE event updates local state. */
+    public Packet rollbackFile(long workspaceId, String relativePath, long fileId,
+                               long sourceVersion, long totalSize) throws Exception {
+        if (workspace(workspaceId) == null) throw new IllegalArgumentException("Workspace not found");
+        if (fileId <= 0 || sourceVersion <= 0 || totalSize < 0) {
+            throw new IllegalArgumentException("Invalid file, source version, or size");
+        }
+        if (!allowed(workspace(workspaceId), "MODIFY")) throw new SecurityException("No MODIFY permission");
+
+        Packet request = Packet.request(FILE_ROLLBACK_REQUEST)
+                .with("fileId", fileId)
+                .with("version", sourceVersion)
+                .with("baseVersion", state.version(workspaceId, relativePath))
+                .with("totalSize", totalSize);
+        Packet response = network.request(request, Duration.ofMinutes(5));
+        if (ERROR.equals(response.type())) throw new IllegalStateException(response.get("message"));
+        if (!OK.equals(response.type())) throw new IllegalStateException("Unexpected rollback response: " + response.type());
+        return response;
     }
 
     public void syncNow() throws Exception {
@@ -372,6 +476,16 @@ public class AgentService implements AutoCloseable {
         }
 
         try {
+            archiveCurrentIfClean(ws, rel, target);
+        } catch (Exception ex) {
+            String key = ws + ":" + rel;
+            warnOnce(key, "Cannot back up the current version of " + rel
+                    + "; the incoming server version was not applied: " + ex.getMessage());
+            scheduleDeferredSync(key, rel);
+            return;
+        }
+
+        try {
             // Suppress any already-scheduled WatchService event caused by replacing the
             // file.
             ignore.ignore(target, 3000);
@@ -429,6 +543,16 @@ public class AgentService implements AutoCloseable {
             notify("WARN", "Unsynced local changes preserved before remote delete: " + conflictCopy);
         }
 
+        try {
+            archiveCurrentIfClean(ws, rel, target);
+        } catch (Exception ex) {
+            String key = ws + ":" + rel;
+            warnOnce(key, "Cannot back up the current version of " + rel
+                    + "; the server delete was not applied: " + ex.getMessage());
+            scheduleDeferredSync(key, rel);
+            return;
+        }
+
         ignore.ignore(target, 3000);
         Files.deleteIfExists(target);
         // Keep a tombstone version instead of removing local state completely.
@@ -479,6 +603,15 @@ public class AgentService implements AutoCloseable {
         Path dir = workspaceDir(ws);
         Files.createDirectories(dir);
         Path target = dir.resolve(source.getFileName().toString());
+        String relativePath = source.getFileName().toString();
+        if (Files.isRegularFile(target)) {
+            long knownVersion = state.version(workspaceId, relativePath);
+            if (isLocalDirty(workspaceId, relativePath, target)) {
+                createConflictCopy(workspaceId, relativePath, target, knownVersion);
+            } else {
+                archiveCurrentIfClean(workspaceId, relativePath, target);
+            }
+        }
         Files.copy(source, target, StandardCopyOption.REPLACE_EXISTING);
     }
 
@@ -498,6 +631,13 @@ public class AgentService implements AutoCloseable {
 
         long baseVersion = state.version(workspaceId, relativePath);
         Path local = safeResolve(workspaceDir(ws), relativePath);
+        if (Files.isRegularFile(local)) {
+            if (isLocalDirty(workspaceId, relativePath, local)) {
+                createConflictCopy(workspaceId, relativePath, local, baseVersion);
+            } else {
+                archiveCurrentIfClean(workspaceId, relativePath, local);
+            }
+        }
         ignore.ignore(local, 3000);
         Files.deleteIfExists(local);
 
@@ -572,6 +712,13 @@ public class AgentService implements AutoCloseable {
         String knownChecksum = state.checksum(workspaceId, relativePath);
         String currentChecksum = HashUtil.sha256(localFile);
         return !Objects.equals(currentChecksum, knownChecksum);
+    }
+
+    private void archiveCurrentIfClean(long workspaceId, String relativePath, Path currentFile) throws Exception {
+        if (!Files.isRegularFile(currentFile) || isLocalDirty(workspaceId, relativePath, currentFile)) return;
+        LocalBackupStore store = localBackupStore;
+        if (store == null) throw new IllegalStateException("Local backup store is not initialized");
+        store.backupIfDifferent(workspaceId, relativePath, state.version(workspaceId, relativePath), currentFile);
     }
 
     private Path createConflictCopy(long workspaceId, String relativePath, Path source, long serverVersion)

@@ -1,6 +1,7 @@
 package vn.edu.pbl4sync.server;
 
 import vn.edu.pbl4sync.common.*;
+import vn.edu.pbl4sync.server.db.ChunkStore;
 import vn.edu.pbl4sync.server.db.Database;
 
 import java.io.IOException;
@@ -8,16 +9,21 @@ import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.charset.StandardCharsets;
 import java.sql.SQLException;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.regex.Pattern;
 
 import static vn.edu.pbl4sync.common.MessageTypes.*;
 
 public class ServerCore implements AutoCloseable {
+    private static final long CHUNK_UPLOAD_TTL_MILLIS = TimeUnit.MINUTES.toMillis(10);
+    private static final int MAX_HEADER_SIZE = 4 * 1024 * 1024;
+    private static final Pattern SHA256 = Pattern.compile("[0-9a-fA-F]{64}");
     private final ServerConfig config;
     private final ConnectionManager connections = new ConnectionManager();
     private final List<ServerLogListener> logListeners = new CopyOnWriteArrayList<>();
@@ -27,12 +33,15 @@ public class ServerCore implements AutoCloseable {
     private volatile boolean running;
     private ServerSocket serverSocket;
     private Database db;
+    private ChunkStore chunkStore;
+    private final ConcurrentMap<ClientSession, ConcurrentMap<String, PendingChunk>> pendingChunkUploads = new ConcurrentHashMap<>();
 
     public ServerCore(ServerConfig config) { this.config = config; }
 
     public synchronized void start() throws Exception {
         if (running) return;
         db = new Database(config.dbUrl(), config.dbUser(), config.dbPassword(), config.dbPoolSize(), config.initialAdminPassword());
+        chunkStore = new ChunkStore(db);
         clientPool = Executors.newFixedThreadPool(config.clientThreads());
         transferPool = Executors.newFixedThreadPool(config.transferThreads());
         serverSocket = new ServerSocket(config.port());
@@ -80,7 +89,10 @@ public class ServerCore implements AutoCloseable {
             case REMOVE_MEMBER_REQUEST -> removeMember(session, p);
             case CHANGE_LEADER_REQUEST -> changeLeader(session, p);
             case DELETE_WORKSPACE_REQUEST -> deleteWorkspace(session, p);
+            case CHUNK_QUERY -> chunkQuery(session, p);
+            case CHUNK_UPLOAD -> chunkUpload(session, received);
             case FILE_EVENT -> fileEvent(session, received);
+            case FILE_ROLLBACK_REQUEST -> rollbackFile(session, p);
             case FILE_APPLIED -> fileApplied(session, p);
             case FILE_RELAY_UPLOAD -> relayUpload(session, received);
             case SYNC_REPORT -> syncReport(session, p);
@@ -243,6 +255,11 @@ public class ServerCore implements AutoCloseable {
 
         boolean deleted = "DELETE".equals(action);
         long baseVersion = p.getLong("baseVersion", 0);
+        if (!deleted) {
+            fileEventChunked(s, received, ws, path, action, baseVersion);
+            return;
+        }
+
         Path cached = null;
         long size = 0;
         String checksum = "";
@@ -288,6 +305,232 @@ public class ServerCore implements AutoCloseable {
             cached = null;
         }
         if (cached != null) Files.deleteIfExists(cached);
+    }
+
+    private void chunkQuery(ClientSession s, Packet p) throws Exception {
+        long ws = p.getLong("workspaceId", 0);
+        String path = sanitizeRelativePath(p.get("path"));
+        String action = p.get("action").toUpperCase(Locale.ROOT);
+        if (!"CREATE".equals(action) && !"MODIFY".equals(action)) {
+            throw new IllegalArgumentException("CHUNK_QUERY action must be CREATE or MODIFY");
+        }
+        Map<String, String> existing = db.findFile(ws, path);
+        boolean existsActive = existing != null && !truthy(existing.get("deleted"));
+        String permission = existsActive ? "MODIFY" : "WRITE";
+        if (!db.hasPermission(s.userId(), s.isAdmin(), ws, permission)) {
+            throw new SecurityException("Permission denied: " + permission);
+        }
+
+        long baseVersion = requireNonNegativeLong(p, "baseVersion");
+        long size = requireNonNegativeLong(p, "size");
+        if (existing == null && baseVersion != 0) throw new IllegalArgumentException("baseVersion must be 0 for a new file");
+        if (existing != null && baseVersion != parseLong(existing.get("version"), -1)) {
+            throw new IllegalArgumentException("File version conflict; request a fresh sync state");
+        }
+        requireHash(p.get("checksum"), "File checksum");
+        ChunkManifest manifest = parseRequestManifest(p);
+        if (manifest.totalSize() != size) throw new IllegalArgumentException("Manifest size does not match size");
+        validateManifestHashSizes(manifest);
+
+        Set<String> missing = chunkStore.missingHashes(manifest.allHashes());
+        List<String> orderedMissing = manifest.allHashes().stream().filter(missing::contains).distinct().toList();
+        String missingHashes = String.join(",", orderedMissing);
+        if (missingHashes.getBytes(StandardCharsets.UTF_8).length > MAX_HEADER_SIZE - 1024) {
+            throw new IllegalArgumentException("CHUNK_QUERY_RESULT exceeds the 4 MiB protocol header limit");
+        }
+
+        long expiresAt = System.currentTimeMillis() + CHUNK_UPLOAD_TTL_MILLIS;
+        ConcurrentMap<String, PendingChunk> staged = pendingChunkUploads.computeIfAbsent(s, ignored -> new ConcurrentHashMap<>());
+        staged.clear();
+        for (ChunkManifest.Entry chunk : manifest.chunks()) {
+            if (missing.contains(chunk.hash())) staged.put(chunk.hash(), new PendingChunk(chunk.length(), expiresAt));
+        }
+        if (staged.isEmpty()) pendingChunkUploads.remove(s, staged);
+
+        s.send(p.response(CHUNK_QUERY_RESULT)
+                .with("missingHashes", missingHashes)
+                .with("missingCount", orderedMissing.size()));
+    }
+
+    private void chunkUpload(ClientSession s, ReceivedPacket received) throws Exception {
+        Packet p = received.packet();
+        String hash = requireHash(p.get("hash"), "Chunk hash").toLowerCase(Locale.ROOT);
+        int size = p.getInt("size", -1);
+        if (size <= 0 || size > RabinChunker.MAX_SIZE) throw new IllegalArgumentException("Invalid chunk size");
+        if (received.payloadPath() == null || received.payloadLength() <= 0) {
+            throw new IllegalArgumentException("Chunk payload required");
+        }
+        if (received.payloadLength() != size || Files.size(received.payloadPath()) != size) {
+            throw new IllegalArgumentException("Declared chunk size does not match payload");
+        }
+
+        ConcurrentMap<String, PendingChunk> staged = pendingChunkUploads.get(s);
+        PendingChunk pending = staged == null ? null : staged.get(hash);
+        if (pending == null || pending.expiresAt() < System.currentTimeMillis()) {
+            if (staged != null && pending != null) staged.remove(hash, pending);
+            throw new IllegalArgumentException("Chunk was not requested or upload authorization expired");
+        }
+        if (pending.size() != size) throw new IllegalArgumentException("Chunk size differs from CHUNK_QUERY manifest");
+
+        byte[] content = Files.readAllBytes(received.payloadPath());
+        chunkStore.saveChunk(hash, size, content);
+        staged.remove(hash, pending);
+        if (staged.isEmpty()) pendingChunkUploads.remove(s, staged);
+        s.send(p.response(OK).with("hash", hash).with("size", size));
+    }
+
+    private void fileEventChunked(ClientSession s, ReceivedPacket received, long ws, String path,
+                                  String action, long baseVersion) throws Exception {
+        Packet p = received.packet();
+        if (received.payloadLength() != 0) throw new IllegalArgumentException("Chunked FILE_EVENT must not include a file payload");
+        ChunkManifest manifest = parseRequestManifest(p);
+        long size = requireNonNegativeLong(p, "size");
+        if (manifest.totalSize() != size) throw new IllegalArgumentException("Manifest size does not match size");
+        validateManifestHashSizes(manifest);
+        String checksum = requireHash(p.get("checksum"), "File checksum").toLowerCase(Locale.ROOT);
+
+        Path assembled = Files.createTempFile("pbl4sync-chunked-", ".tmp");
+        boolean handedToBroadcast = false;
+        try {
+            manifest.assembleTo(assembled, hash -> {
+                try {
+                    return chunkStore.loadChunk(hash);
+                } catch (SQLException e) {
+                    throw new IllegalStateException("Unable to load required chunk " + hash, e);
+                }
+            });
+            if (Files.size(assembled) != size) throw new IllegalArgumentException("Assembled file size does not match manifest");
+            String assembledChecksum = HashUtil.sha256(assembled);
+            if (!assembledChecksum.equalsIgnoreCase(checksum)) {
+                throw new IllegalArgumentException("Assembled file SHA-256 does not match FILE_EVENT checksum");
+            }
+
+            Map<String, String> file = db.applyFileChangeChunked(ws, path, size, checksum, s.userId(),
+                    s.deviceName(), baseVersion, manifest);
+            if (truthy(file.get("conflict"))) {
+                s.send(p.response(FILE_EVENT_RESULT)
+                        .with("success", false)
+                        .with("conflict", true)
+                        .with("path", path)
+                        .with("workspaceId", ws)
+                        .with("baseVersion", baseVersion)
+                        .with("currentVersion", file.getOrDefault("current_version", "0"))
+                        .with("currentChecksum", file.getOrDefault("current_checksum", ""))
+                        .with("currentDeleted", file.getOrDefault("current_deleted", "false")));
+                return;
+            }
+
+            long fileId = Long.parseLong(file.get("id"));
+            long version = Long.parseLong(file.get("version"));
+            db.markReplica(fileId, s.agentId(), version, checksum);
+            db.logActivity(s.userId(), ws, action, path + " v" + version);
+            s.send(p.response(FILE_EVENT_RESULT).with("success", true).with("fileId", fileId).with("version", version)
+                    .with("checksum", checksum).with("size", size).with("path", path).with("workspaceId", ws));
+
+            Packet deliver = Packet.event(FILE_DELIVER).with("workspaceId", ws).with("path", path).with("fileId", fileId)
+                    .with("version", version).with("checksum", checksum).with("size", size).with("conflict", false);
+            broadcastToWorkspace(ws, deliver, assembled, s.agentId());
+            handedToBroadcast = true;
+        } finally {
+            if (!handedToBroadcast) Files.deleteIfExists(assembled);
+        }
+    }
+
+    private void rollbackFile(ClientSession s, Packet p) throws Exception {
+        long fileId = p.getLong("fileId", 0);
+        long sourceVersion = p.getLong("version", 0);
+        long baseVersion = requireNonNegativeLong(p, "baseVersion");
+        long totalSize = requireNonNegativeLong(p, "totalSize");
+        if (fileId <= 0 || sourceVersion <= 0) throw new IllegalArgumentException("Invalid file or source version");
+        Map<String, String> current = db.findFileById(fileId);
+        if (current == null) throw new IllegalArgumentException("File does not exist");
+        long ws = parseLong(current.get("workspace_id"), 0);
+        String path = sanitizeRelativePath(current.get("relative_path"));
+        if (!db.hasPermission(s.userId(), s.isAdmin(), ws, "READ")) throw new SecurityException("Read permission denied");
+        if (!db.hasPermission(s.userId(), s.isAdmin(), ws, "MODIFY")) throw new SecurityException("Modify permission denied");
+        if (baseVersion != parseLong(current.get("version"), -1)) {
+            s.send(p.response(OK).with("success", false).with("conflict", true)
+                    .with("currentVersion", current.getOrDefault("version", "0"))
+                    .with("currentChecksum", current.getOrDefault("checksum", "")));
+            return;
+        }
+
+        ChunkManifest manifest = chunkStore.loadManifest(fileId, sourceVersion, totalSize);
+        Path assembled = Files.createTempFile("pbl4sync-rollback-", ".tmp");
+        boolean handedToBroadcast = false;
+        try {
+            manifest.assembleTo(assembled, hash -> {
+                try {
+                    return chunkStore.loadChunk(hash);
+                } catch (SQLException e) {
+                    throw new IllegalStateException("Unable to load required chunk " + hash, e);
+                }
+            });
+            Map<String, String> result = db.copyFileVersion(fileId, sourceVersion, baseVersion,
+                    s.userId(), s.deviceName());
+            if (truthy(result.get("conflict"))) {
+                s.send(p.response(OK).with("success", false).with("conflict", true)
+                        .with("currentVersion", result.getOrDefault("current_version", "0"))
+                        .with("currentChecksum", result.getOrDefault("current_checksum", "")));
+                return;
+            }
+
+            long newVersion = Long.parseLong(result.get("version"));
+            String checksum = result.getOrDefault("checksum", "");
+            boolean deleted = truthy(result.get("deleted"));
+            db.logActivity(s.userId(), ws, "ROLLBACK", path + " v" + newVersion + " from v" + sourceVersion);
+            s.send(p.response(OK).with("success", true).with("fileId", fileId).with("version", newVersion)
+                    .with("rollbackFromVersion", sourceVersion).with("checksum", checksum)
+                    .with("size", result.getOrDefault("size", Long.toString(totalSize))));
+
+            if (deleted) {
+                Packet del = Packet.event(FILE_DELETE).with("workspaceId", ws).with("path", path)
+                        .with("fileId", fileId).with("version", newVersion);
+                broadcastToWorkspace(ws, del, null, -1);
+            } else {
+                Packet deliver = Packet.event(FILE_DELIVER).with("workspaceId", ws).with("path", path).with("fileId", fileId)
+                        .with("version", newVersion).with("checksum", checksum).with("size", totalSize).with("conflict", false);
+                broadcastToWorkspace(ws, deliver, assembled, -1);
+                handedToBroadcast = true;
+            }
+        } finally {
+            if (!handedToBroadcast) Files.deleteIfExists(assembled);
+        }
+    }
+
+    private ChunkManifest parseRequestManifest(Packet p) {
+        String text = p.get("manifest");
+        int encodedSize = text.getBytes(StandardCharsets.UTF_8).length;
+        if (encodedSize > MAX_HEADER_SIZE - 1024) {
+            throw new IllegalArgumentException("Manifest exceeds the 4 MiB protocol header limit");
+        }
+        return ChunkManifest.parse(text);
+    }
+
+    private String requireHash(String hash, String label) {
+        if (hash == null || !SHA256.matcher(hash).matches()) throw new IllegalArgumentException(label + " must be a 64-character SHA-256 hash");
+        return hash;
+    }
+
+    private long requireNonNegativeLong(Packet p, String field) {
+        String raw = p.get(field);
+        try {
+            long value = Long.parseLong(raw);
+            if (value < 0) throw new NumberFormatException();
+            return value;
+        } catch (NumberFormatException e) {
+            throw new IllegalArgumentException("Invalid non-negative " + field);
+        }
+    }
+
+    private void validateManifestHashSizes(ChunkManifest manifest) {
+        Map<String, Integer> sizes = new HashMap<>();
+        for (ChunkManifest.Entry chunk : manifest.chunks()) {
+            Integer previous = sizes.putIfAbsent(chunk.hash(), chunk.length());
+            if (previous != null && previous != chunk.length()) {
+                throw new IllegalArgumentException("Manifest assigns multiple sizes to the same chunk hash");
+            }
+        }
     }
 
     private void fileApplied(ClientSession s, Packet p) throws Exception {
@@ -495,6 +738,7 @@ public class ServerCore implements AutoCloseable {
     private long parseLong(String s, long fallback) { try { return Long.parseLong(s); } catch (Exception e) { return fallback; } }
 
     public void onDisconnected(ClientSession s) {
+        pendingChunkUploads.remove(s);
         connections.remove(s);
         if (s.authenticated()) {
             try {
@@ -531,6 +775,7 @@ public class ServerCore implements AutoCloseable {
         log("Server stopped");
     }
 
+    private record PendingChunk(int size, long expiresAt) { }
     private record RelayTicket(String id, long sourceAgentId, long targetAgentId, long fileId, long version, long workspaceId, long expiresAt) { }
 
     @Override public void close() { stop(); }

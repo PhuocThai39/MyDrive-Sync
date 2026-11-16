@@ -1,7 +1,9 @@
 package vn.edu.pbl4sync.server.db;
 
+import vn.edu.pbl4sync.common.ChunkManifest;
 import vn.edu.pbl4sync.common.HashUtil;
 
+import java.nio.charset.StandardCharsets;
 import java.sql.*;
 import java.time.LocalDateTime;
 import java.util.*;
@@ -15,6 +17,10 @@ public class Database implements AutoCloseable {
         initializeSchema();
         markAllAgentsOffline();
         seedAdmin(initialAdminPassword);
+    }
+
+    SimpleConnectionPool pool() {
+        return pool;
     }
 
     private void initializeSchema() throws SQLException {
@@ -80,6 +86,48 @@ public class Database implements AutoCloseable {
               INDEX idx_files_ws(workspace_id),
               CONSTRAINT fk_file_ws FOREIGN KEY(workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE,
               CONSTRAINT fk_file_user FOREIGN KEY(modified_by) REFERENCES users(id) ON DELETE SET NULL
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS file_versions (
+              id BIGINT PRIMARY KEY AUTO_INCREMENT,
+              file_id BIGINT NOT NULL,
+              version BIGINT NOT NULL,
+              base_version BIGINT NOT NULL,
+              checksum VARCHAR(128) NOT NULL,
+              manifest MEDIUMTEXT NOT NULL,
+              is_deleted BOOLEAN NOT NULL DEFAULT FALSE,
+              source_user_id BIGINT NULL,
+              source_device VARCHAR(180),
+              operation VARCHAR(30) NOT NULL,
+              rollback_from_version BIGINT NULL,
+              created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              UNIQUE KEY uq_file_version(file_id,version),
+              CONSTRAINT fk_file_versions_file FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE,
+              CONSTRAINT fk_file_versions_user FOREIGN KEY(source_user_id) REFERENCES users(id) ON DELETE SET NULL
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS chunks (
+              hash VARCHAR(64) PRIMARY KEY,
+              size INT NOT NULL,
+              content LONGBLOB NOT NULL,
+              created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS file_version_chunks (
+              file_id BIGINT NOT NULL,
+              version BIGINT NOT NULL,
+              chunk_order INT NOT NULL,
+              chunk_hash VARCHAR(64) NOT NULL,
+              chunk_size INT NOT NULL,
+              PRIMARY KEY(file_id,version,chunk_order),
+              INDEX idx_fvc_chunk_hash(chunk_hash),
+              CONSTRAINT fk_fvc_file FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE,
+              CONSTRAINT fk_fvc_version FOREIGN KEY(file_id,version)
+                REFERENCES file_versions(file_id,version) ON DELETE CASCADE,
+              CONSTRAINT fk_fvc_chunk FOREIGN KEY(chunk_hash) REFERENCES chunks(hash)
             )
             """,
             """
@@ -439,6 +487,327 @@ public class Database implements AutoCloseable {
         } finally {
             try { c.setAutoCommit(true); } catch (SQLException ignored) { }
             pool.release(c);
+        }
+    }
+
+    /**
+     * Applies a chunk-backed CREATE/MODIFY and records its version and chunk
+     * mapping in the same transaction. The existing applyFileChange method is
+     * intentionally retained for legacy payloads and DELETE events.
+     */
+    public Map<String, String> applyFileChangeChunked(long workspaceId, String path, long size,
+                                                       String checksum, long userId, String sourceDevice,
+                                                       long baseVersion, ChunkManifest manifest) throws SQLException {
+        if (path == null || path.isBlank()) throw new IllegalArgumentException("File path is required");
+        if (size < 0) throw new IllegalArgumentException("File size cannot be negative");
+        if (checksum == null || !checksum.matches("[0-9a-fA-F]{64}")) {
+            throw new IllegalArgumentException("File checksum must be a 64-character SHA-256 hash");
+        }
+        if (baseVersion < 0) throw new IllegalArgumentException("Base version cannot be negative");
+        Objects.requireNonNull(manifest, "manifest");
+        if (manifest.totalSize() != size) throw new IllegalArgumentException("Manifest size does not match file size");
+        String manifestText = manifest.serialize();
+        if (manifestText.getBytes(StandardCharsets.UTF_8).length > 16_777_215) {
+            throw new IllegalArgumentException("Manifest exceeds the MEDIUMTEXT size limit");
+        }
+
+        Connection c = pool.borrow();
+        try {
+            c.setAutoCommit(false);
+            Map<String, String> existing = queryOne(c,
+                    "SELECT id,size,checksum,version,deleted FROM files WHERE workspace_id=? AND relative_path=? FOR UPDATE",
+                    workspaceId, path);
+
+            if (existing == null && baseVersion != 0) {
+                c.rollback();
+                return row("conflict", true, "current_version", 0, "current_checksum", "", "current_deleted", true);
+            }
+            if (existing != null) {
+                long currentVersion = Long.parseLong(existing.get("version"));
+                if (baseVersion != currentVersion) {
+                    c.rollback();
+                    return row(
+                            "conflict", true,
+                            "id", existing.get("id"),
+                            "current_version", currentVersion,
+                            "current_checksum", existing.getOrDefault("checksum", ""),
+                            "current_deleted", existing.getOrDefault("deleted", "false"),
+                            "current_size", existing.getOrDefault("size", "0")
+                    );
+                }
+            }
+
+            verifyManifestChunks(c, manifest);
+
+            long fileId;
+            long version;
+            String operation;
+            if (existing == null) {
+                try (PreparedStatement ps = c.prepareStatement(
+                        "INSERT INTO files(workspace_id,relative_path,size,checksum,version,modified_by,modified_at,deleted) VALUES(?,?,?,?,1,?,NOW(),FALSE)",
+                        Statement.RETURN_GENERATED_KEYS)) {
+                    ps.setLong(1, workspaceId);
+                    ps.setString(2, path);
+                    ps.setLong(3, size);
+                    ps.setString(4, checksum);
+                    ps.setLong(5, userId);
+                    ps.executeUpdate();
+                    try (ResultSet rs = ps.getGeneratedKeys()) {
+                        if (!rs.next()) throw new SQLException("Database did not return the new file id");
+                        fileId = rs.getLong(1);
+                    }
+                }
+                version = 1;
+                operation = "CREATE";
+            } else {
+                fileId = Long.parseLong(existing.get("id"));
+                long currentVersion = Long.parseLong(existing.get("version"));
+                try {
+                    version = Math.addExact(currentVersion, 1);
+                } catch (ArithmeticException e) {
+                    throw new SQLException("File version number overflow", e);
+                }
+                operation = "true".equalsIgnoreCase(existing.getOrDefault("deleted", "false"))
+                        || "1".equals(existing.getOrDefault("deleted", "false")) ? "CREATE" : "MODIFY";
+                try (PreparedStatement ps = c.prepareStatement(
+                        "UPDATE files SET size=?,checksum=?,version=?,modified_by=?,modified_at=NOW(),deleted=FALSE WHERE id=?")) {
+                    ps.setLong(1, size);
+                    ps.setString(2, checksum);
+                    ps.setLong(3, version);
+                    ps.setLong(4, userId);
+                    ps.setLong(5, fileId);
+                    ps.executeUpdate();
+                }
+            }
+
+            insertFileVersion(c, fileId, version, baseVersion, checksum, manifestText, false,
+                    userId, sourceDevice, operation, null);
+            insertVersionChunks(c, fileId, version, manifest);
+            c.commit();
+            return row(
+                    "conflict", false,
+                    "id", fileId,
+                    "workspace_id", workspaceId,
+                    "relative_path", path,
+                    "size", size,
+                    "checksum", checksum,
+                    "version", version,
+                    "deleted", false
+            );
+        } catch (SQLException | RuntimeException e) {
+            try { c.rollback(); } catch (SQLException ignored) { }
+            throw e;
+        } finally {
+            try { c.setAutoCommit(true); } catch (SQLException ignored) { }
+            pool.release(c);
+        }
+    }
+
+    /**
+     * Creates a new ROLLBACK version from an existing chunk-backed snapshot.
+     * The source version remains immutable and its chunk mappings are copied
+     * into the new version atomically with the current files row.
+     */
+    public Map<String, String> copyFileVersion(long fileId, long sourceVersion, long baseVersion,
+                                               long userId, String sourceDevice) throws SQLException {
+        if (fileId <= 0 || sourceVersion <= 0 || baseVersion < 0) {
+            throw new IllegalArgumentException("Invalid file or version number");
+        }
+
+        Connection c = pool.borrow();
+        try {
+            c.setAutoCommit(false);
+            Map<String, String> current = queryOne(c,
+                    "SELECT id,workspace_id,relative_path,size,checksum,version,deleted FROM files WHERE id=? FOR UPDATE",
+                    fileId);
+            if (current == null) throw new SQLException("File does not exist: " + fileId);
+
+            long currentVersion = Long.parseLong(current.get("version"));
+            if (baseVersion != currentVersion) {
+                c.rollback();
+                return row(
+                        "conflict", true,
+                        "id", fileId,
+                        "current_version", currentVersion,
+                        "current_checksum", current.getOrDefault("checksum", ""),
+                        "current_deleted", current.getOrDefault("deleted", "false"),
+                        "current_size", current.getOrDefault("size", "0")
+                );
+            }
+
+            Map<String, String> source = queryOne(c,
+                    "SELECT checksum,manifest,is_deleted FROM file_versions WHERE file_id=? AND version=?",
+                    fileId, sourceVersion);
+            if (source == null) throw new SQLException("Snapshot version not found: " + sourceVersion);
+            String checksum = source.getOrDefault("checksum", "");
+            String manifestText = source.getOrDefault("manifest", "");
+            ChunkManifest manifest;
+            try {
+                manifest = ChunkManifest.parse(manifestText);
+            } catch (IllegalArgumentException e) {
+                throw new SQLException("Snapshot manifest is invalid for version " + sourceVersion, e);
+            }
+            boolean deleted = "true".equalsIgnoreCase(source.getOrDefault("is_deleted", "false"))
+                    || "1".equals(source.getOrDefault("is_deleted", "false"));
+            if (deleted && manifest.totalSize() != 0) {
+                throw new SQLException("Deleted snapshot has a non-empty manifest");
+            }
+            verifyManifestChunks(c, manifest);
+            verifyVersionChunkMapping(c, fileId, sourceVersion, manifest);
+
+            long newVersion;
+            try {
+                newVersion = Math.addExact(currentVersion, 1);
+            } catch (ArithmeticException e) {
+                throw new SQLException("File version number overflow", e);
+            }
+
+            try (PreparedStatement ps = c.prepareStatement(
+                    "UPDATE files SET size=?,checksum=?,version=?,modified_by=?,modified_at=NOW(),deleted=? WHERE id=?")) {
+                ps.setLong(1, manifest.totalSize());
+                ps.setString(2, checksum);
+                ps.setLong(3, newVersion);
+                ps.setLong(4, userId);
+                ps.setBoolean(5, deleted);
+                ps.setLong(6, fileId);
+                ps.executeUpdate();
+            }
+
+            insertFileVersion(c, fileId, newVersion, currentVersion, checksum, manifestText, deleted,
+                    userId, sourceDevice, "ROLLBACK", sourceVersion);
+            try (PreparedStatement ps = c.prepareStatement("""
+                    INSERT INTO file_version_chunks(file_id,version,chunk_order,chunk_hash,chunk_size)
+                    SELECT file_id,?,chunk_order,chunk_hash,chunk_size
+                    FROM file_version_chunks WHERE file_id=? AND version=? ORDER BY chunk_order
+                    """)) {
+                ps.setLong(1, newVersion);
+                ps.setLong(2, fileId);
+                ps.setLong(3, sourceVersion);
+                ps.executeUpdate();
+            }
+
+            c.commit();
+            return row(
+                    "conflict", false,
+                    "id", fileId,
+                    "workspace_id", current.get("workspace_id"),
+                    "relative_path", current.get("relative_path"),
+                    "size", manifest.totalSize(),
+                    "checksum", checksum,
+                    "version", newVersion,
+                    "deleted", deleted,
+                    "rollback_from_version", sourceVersion
+            );
+        } catch (SQLException | RuntimeException e) {
+            try { c.rollback(); } catch (SQLException ignored) { }
+            throw e;
+        } finally {
+            try { c.setAutoCommit(true); } catch (SQLException ignored) { }
+            pool.release(c);
+        }
+    }
+
+    private void verifyManifestChunks(Connection c, ChunkManifest manifest) throws SQLException {
+        Map<String, Integer> expectedSizes = new LinkedHashMap<>();
+        for (ChunkManifest.Entry entry : manifest.chunks()) {
+            Integer previous = expectedSizes.putIfAbsent(entry.hash(), entry.length());
+            if (previous != null && previous != entry.length()) {
+                throw new SQLException("Manifest assigns multiple sizes to chunk " + entry.hash());
+            }
+        }
+
+        List<Map.Entry<String, Integer>> uniqueChunks = new ArrayList<>(expectedSizes.entrySet());
+        final int batchSize = 500;
+        for (int start = 0; start < uniqueChunks.size(); start += batchSize) {
+            int end = Math.min(start + batchSize, uniqueChunks.size());
+            String placeholders = String.join(",", Collections.nCopies(end - start, "?"));
+            Map<String, Integer> foundSizes = new HashMap<>();
+            try (PreparedStatement ps = c.prepareStatement("SELECT hash,size FROM chunks WHERE hash IN (" + placeholders + ")")) {
+                for (int i = start; i < end; i++) ps.setString(i - start + 1, uniqueChunks.get(i).getKey());
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) foundSizes.put(rs.getString("hash"), rs.getInt("size"));
+                }
+            }
+            for (int i = start; i < end; i++) {
+                Map.Entry<String, Integer> expected = uniqueChunks.get(i);
+                Integer actual = foundSizes.get(expected.getKey());
+                if (actual == null) throw new SQLException("Required chunk is missing: " + expected.getKey());
+                if (!actual.equals(expected.getValue())) {
+                    throw new SQLException("Stored chunk size mismatch: " + expected.getKey());
+                }
+            }
+        }
+    }
+
+    private void verifyVersionChunkMapping(Connection c, long fileId, long version,
+                                           ChunkManifest manifest) throws SQLException {
+        int order = 0;
+        try (PreparedStatement ps = c.prepareStatement("""
+                SELECT chunk_order,chunk_hash,chunk_size
+                FROM file_version_chunks WHERE file_id=? AND version=? ORDER BY chunk_order ASC
+                """)) {
+            ps.setLong(1, fileId);
+            ps.setLong(2, version);
+            try (ResultSet rs = ps.executeQuery()) {
+                for (ChunkManifest.Entry expected : manifest.chunks()) {
+                    if (!rs.next()) throw new SQLException("Snapshot has an incomplete chunk mapping");
+                    if (rs.getInt("chunk_order") != order
+                            || !expected.hash().equals(rs.getString("chunk_hash"))
+                            || expected.length() != rs.getInt("chunk_size")) {
+                        throw new SQLException("Snapshot chunk mapping does not match its manifest");
+                    }
+                    order++;
+                }
+                if (rs.next()) throw new SQLException("Snapshot contains unexpected chunk mappings");
+            }
+        }
+    }
+
+    private void insertFileVersion(Connection c, long fileId, long version, long baseVersion,
+                                   String checksum, String manifest, boolean deleted, long userId,
+                                   String sourceDevice, String operation, Long rollbackFromVersion) throws SQLException {
+        try (PreparedStatement ps = c.prepareStatement("""
+                INSERT INTO file_versions(file_id,version,base_version,checksum,manifest,is_deleted,
+                                          source_user_id,source_device,operation,rollback_from_version)
+                VALUES(?,?,?,?,?,?,?,?,?,?)
+                """)) {
+            ps.setLong(1, fileId);
+            ps.setLong(2, version);
+            ps.setLong(3, baseVersion);
+            ps.setString(4, checksum);
+            ps.setString(5, manifest);
+            ps.setBoolean(6, deleted);
+            ps.setLong(7, userId);
+            ps.setString(8, sourceDevice);
+            ps.setString(9, operation);
+            if (rollbackFromVersion == null) ps.setNull(10, Types.BIGINT);
+            else ps.setLong(10, rollbackFromVersion);
+            ps.executeUpdate();
+        }
+    }
+
+    private void insertVersionChunks(Connection c, long fileId, long version,
+                                     ChunkManifest manifest) throws SQLException {
+        if (manifest.chunkCount() == 0) return;
+        try (PreparedStatement ps = c.prepareStatement("""
+                INSERT INTO file_version_chunks(file_id,version,chunk_order,chunk_hash,chunk_size)
+                VALUES(?,?,?,?,?)
+                """)) {
+            int order = 0;
+            int pending = 0;
+            for (ChunkManifest.Entry chunk : manifest.chunks()) {
+                ps.setLong(1, fileId);
+                ps.setLong(2, version);
+                ps.setInt(3, order++);
+                ps.setString(4, chunk.hash());
+                ps.setInt(5, chunk.length());
+                ps.addBatch();
+                if (++pending == 500) {
+                    ps.executeBatch();
+                    pending = 0;
+                }
+            }
+            if (pending > 0) ps.executeBatch();
         }
     }
 
