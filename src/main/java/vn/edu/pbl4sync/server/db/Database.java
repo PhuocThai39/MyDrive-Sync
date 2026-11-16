@@ -629,6 +629,31 @@ public class Database implements AutoCloseable {
      */
     public Map<String, String> copyFileVersion(long fileId, long sourceVersion, long baseVersion,
                                                long userId, String sourceDevice) throws SQLException {
+        return copyFileVersionInternal(fileId, null, sourceVersion, baseVersion, userId,
+                sourceDevice, null, false);
+    }
+
+    /**
+     * Creates a new rollback version and its successful Activity row atomically.
+     * The source version and all older versions remain unchanged. The supplied
+     * checksum is the SHA-256 of the assembled source snapshot (empty for a
+     * deleted snapshot).
+     */
+    public Map<String, String> rollbackFileVersion(long fileId, long workspaceId,
+                                                   long sourceVersion, long baseVersion,
+                                                   long userId, String sourceDevice,
+                                                   String assembledChecksum) throws SQLException {
+        if (workspaceId <= 0) throw new IllegalArgumentException("Workspace ID must be positive");
+        if (userId <= 0) throw new IllegalArgumentException("User ID must be positive");
+        return copyFileVersionInternal(fileId, workspaceId, sourceVersion, baseVersion, userId,
+                sourceDevice, assembledChecksum, true);
+    }
+
+    private Map<String, String> copyFileVersionInternal(long fileId, Long expectedWorkspaceId,
+                                                        long sourceVersion, long baseVersion,
+                                                        long userId, String sourceDevice,
+                                                        String assembledChecksum, boolean recordActivity)
+            throws SQLException {
         if (fileId <= 0 || sourceVersion <= 0 || baseVersion < 0) {
             throw new IllegalArgumentException("Invalid file or version number");
         }
@@ -640,6 +665,10 @@ public class Database implements AutoCloseable {
                     "SELECT id,workspace_id,relative_path,size,checksum,version,deleted FROM files WHERE id=? FOR UPDATE",
                     fileId);
             if (current == null) throw new SQLException("File does not exist: " + fileId);
+            long workspaceId = Long.parseLong(current.get("workspace_id"));
+            if (expectedWorkspaceId != null && workspaceId != expectedWorkspaceId) {
+                throw new SQLException("File does not belong to workspace " + expectedWorkspaceId);
+            }
 
             long currentVersion = Long.parseLong(current.get("version"));
             if (baseVersion != currentVersion) {
@@ -655,9 +684,11 @@ public class Database implements AutoCloseable {
             }
 
             Map<String, String> source = queryOne(c,
-                    "SELECT checksum,manifest,is_deleted FROM file_versions WHERE file_id=? AND version=?",
+                    "SELECT checksum,manifest,is_deleted FROM file_versions WHERE file_id=? AND version=? FOR UPDATE",
                     fileId, sourceVersion);
-            if (source == null) throw new SQLException("Snapshot version not found: " + sourceVersion);
+            if (source == null) {
+                throw new SQLException("Snapshot version " + sourceVersion + " does not belong to file " + fileId);
+            }
             String checksum = source.getOrDefault("checksum", "");
             String manifestText = source.getOrDefault("manifest", "");
             ChunkManifest manifest;
@@ -670,6 +701,10 @@ public class Database implements AutoCloseable {
                     || "1".equals(source.getOrDefault("is_deleted", "false"));
             if (deleted && manifest.totalSize() != 0) {
                 throw new SQLException("Deleted snapshot has a non-empty manifest");
+            }
+            if (recordActivity && !deleted
+                    && (assembledChecksum == null || !checksum.equalsIgnoreCase(assembledChecksum))) {
+                throw new SQLException("Assembled file checksum does not match the source snapshot");
             }
             verifyManifestChunks(c, manifest);
             verifyVersionChunkMapping(c, fileId, sourceVersion, manifest);
@@ -689,7 +724,7 @@ public class Database implements AutoCloseable {
                 ps.setLong(4, userId);
                 ps.setBoolean(5, deleted);
                 ps.setLong(6, fileId);
-                ps.executeUpdate();
+                if (ps.executeUpdate() != 1) throw new SQLException("File metadata was not updated");
             }
 
             insertFileVersion(c, fileId, newVersion, currentVersion, checksum, manifestText, deleted,
@@ -704,17 +739,47 @@ public class Database implements AutoCloseable {
                 ps.setLong(3, sourceVersion);
                 ps.executeUpdate();
             }
+            verifyVersionChunkMapping(c, fileId, newVersion, manifest);
+
+            if (recordActivity) {
+                String detail = "Rollback from v" + currentVersion + " to v" + sourceVersion
+                        + ", created v" + newVersion + " (" + current.get("relative_path") + ")";
+                try (PreparedStatement ps = c.prepareStatement(
+                        "INSERT INTO activities(user_id,workspace_id,action,detail) VALUES(?,?,?,?)")) {
+                    ps.setLong(1, userId);
+                    ps.setLong(2, workspaceId);
+                    ps.setString(3, "ROLLBACK");
+                    ps.setString(4, detail);
+                    ps.executeUpdate();
+                }
+            }
 
             c.commit();
+            if (!recordActivity) {
+                return row(
+                        "conflict", false,
+                        "id", fileId,
+                        "workspace_id", current.get("workspace_id"),
+                        "relative_path", current.get("relative_path"),
+                        "size", manifest.totalSize(),
+                        "checksum", checksum,
+                        "version", newVersion,
+                        "deleted", deleted,
+                        "rollback_from_version", sourceVersion
+                );
+            }
             return row(
                     "conflict", false,
                     "id", fileId,
-                    "workspace_id", current.get("workspace_id"),
+                    "workspace_id", workspaceId,
                     "relative_path", current.get("relative_path"),
-                    "size", manifest.totalSize(),
-                    "checksum", checksum,
+                    "base_version", currentVersion,
                     "version", newVersion,
+                    "checksum", checksum,
+                    "size", manifest.totalSize(),
+                    "manifest", manifestText,
                     "deleted", deleted,
+                    "operation", "ROLLBACK",
                     "rollback_from_version", sourceVersion
             );
         } catch (SQLException | RuntimeException e) {

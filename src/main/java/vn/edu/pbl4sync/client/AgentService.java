@@ -4,6 +4,7 @@ import vn.edu.pbl4sync.client.sync.*;
 import vn.edu.pbl4sync.common.*;
 
 import java.awt.Desktop;
+import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
 import java.security.MessageDigest;
@@ -350,9 +351,9 @@ public class AgentService implements AutoCloseable {
 
     /** Requests a server-side rollback; the resulting FILE_DELIVER/FILE_DELETE event updates local state. */
     public Packet rollbackFile(long workspaceId, String relativePath, long fileId,
-                               long sourceVersion, long totalSize) throws Exception {
+                               long currentFileVersion, long sourceVersion, long totalSize) throws Exception {
         if (workspace(workspaceId) == null) throw new IllegalArgumentException("Workspace not found");
-        if (fileId <= 0 || sourceVersion <= 0 || totalSize < 0) {
+        if (fileId <= 0 || currentFileVersion <= 0 || sourceVersion <= 0 || totalSize < 0) {
             throw new IllegalArgumentException("Invalid file, source version, or size");
         }
         if (!allowed(workspace(workspaceId), "MODIFY")) throw new SecurityException("No MODIFY permission");
@@ -360,7 +361,7 @@ public class AgentService implements AutoCloseable {
         Packet request = Packet.request(FILE_ROLLBACK_REQUEST)
                 .with("fileId", fileId)
                 .with("version", sourceVersion)
-                .with("baseVersion", state.version(workspaceId, relativePath))
+                .with("baseVersion", currentFileVersion)
                 .with("totalSize", totalSize);
         Packet response = network.request(request, Duration.ofMinutes(5));
         if (ERROR.equals(response.type())) throw new IllegalStateException(response.get("message"));
@@ -434,8 +435,7 @@ public class AgentService implements AutoCloseable {
     }
 
     private void applyDeliveredFile(Packet p, Path tempPayload) throws Exception {
-        if (tempPayload == null)
-            return;
+        if (tempPayload == null) throw new IOException("Received FILE_DELIVER without a payload");
         long ws = p.getLong("workspaceId", 0);
         Map<String, String> workspace = workspace(ws);
         if (workspace == null) {
@@ -449,6 +449,14 @@ public class AgentService implements AutoCloseable {
         long incomingVersion = p.getLong("version", 0);
         long knownVersion = state.version(ws, rel);
         String remoteChecksum = p.get("checksum");
+        long expectedSize = p.getLong("size", -1);
+        if (expectedSize < 0 || Files.size(tempPayload) != expectedSize) {
+            throw new IOException("Incoming file size does not match FILE_DELIVER metadata");
+        }
+        String payloadChecksum = HashUtil.sha256(tempPayload);
+        if (remoteChecksum.isBlank() || !remoteChecksum.equalsIgnoreCase(payloadChecksum)) {
+            throw new IOException("Incoming file checksum does not match FILE_DELIVER metadata");
+        }
         Path target = safeResolve(workspaceDir(workspace), rel);
         String localChecksum = Files.isRegularFile(target) ? HashUtil.sha256(target) : "";
         boolean staleRemoteVersion = incomingVersion < knownVersion;
@@ -469,61 +477,79 @@ public class AgentService implements AutoCloseable {
         }
 
         Files.createDirectories(target.getParent());
-
-        boolean dirty = Files.isRegularFile(target) && isLocalDirty(ws, rel, target);
-        boolean conflict = p.getBoolean("conflict", false) || dirty;
-        if (conflict && Files.isRegularFile(target)) {
-            createConflictCopy(ws, rel, target, incomingVersion);
-            warnOnce("conflict-local:" + ws + ":" + rel,
-                    "Conflict copy created for " + rel
-                            + ". Local changes were preserved and the server version is waiting for resolution.");
-        }
-
+        Path stagedPayload = Files.createTempFile(target.getParent(), ".pbl4sync-receive-", ".tmp");
         try {
-            archiveCurrentIfClean(ws, rel, target);
-        } catch (Exception ex) {
-            String key = ws + ":" + rel;
-            warnOnce(key, "Cannot back up the current version of " + rel
-                    + "; the incoming server version was not applied: " + ex.getMessage());
-            scheduleDeferredSync(key, rel);
-            return;
-        }
+            ignore.ignore(stagedPayload, 3000);
+            Files.copy(tempPayload, stagedPayload, StandardCopyOption.REPLACE_EXISTING);
+            if (Files.size(stagedPayload) != expectedSize
+                    || !remoteChecksum.equalsIgnoreCase(HashUtil.sha256(stagedPayload))) {
+                throw new IOException("Staged file failed size or SHA-256 verification");
+            }
 
-        try {
-            // Suppress any already-scheduled WatchService event caused by replacing the
-            // file.
-            ignore.ignore(target, 3000);
-            Files.copy(tempPayload, target, StandardCopyOption.REPLACE_EXISTING);
-            suppressedWarnings.remove(ws + ":" + rel);
-            pendingDeferredSync.remove(ws + ":" + rel);
-            pendingLocalUploadRetry.remove(ws + ":" + rel);
-        } catch (Exception ex) {
-            String key = ws + ":" + rel;
-            if (Files.isRegularFile(target)) {
-                if (!dirty) {
-                    warnOnce(key, "New server version received for " + rel
-                            + ", but the file is currently locked; sync will retry after it is closed.");
-                    scheduleDeferredSync(key, rel);
-                    return;
-                }
-                warnOnce(key, "Conflict detected for " + rel
-                        + ". Local changes were preserved. The server version remains authoritative until resolved.");
-                scheduleLocalUploadRetry(key, ws, rel);
+            boolean dirty = Files.isRegularFile(target) && isLocalDirty(ws, rel, target);
+            boolean conflict = p.getBoolean("conflict", false) || dirty;
+            if (conflict && Files.isRegularFile(target)) {
+                createConflictCopy(ws, rel, target, incomingVersion);
+                warnOnce("conflict-local:" + ws + ":" + rel,
+                        "Conflict copy created for " + rel
+                                + ". Local changes were preserved and the server version is waiting for resolution.");
+            }
+
+            try {
+                archiveCurrentIfClean(ws, rel, target);
+            } catch (Exception ex) {
+                String key = ws + ":" + rel;
+                warnOnce(key, "Cannot back up the current version of " + rel
+                        + "; the incoming server version was not applied: " + ex.getMessage());
+                scheduleDeferredSync(key, rel);
                 return;
             }
-            warnOnce(key, "New server version received for " + rel
-                    + ", but the local file is not available right now. Sync will retry when the file is available again.");
-            scheduleDeferredSync(key, rel);
-            return;
-        }
 
-        String checksum = HashUtil.sha256(target);
-        state.put(ws, rel, incomingVersion, checksum);
-        network.send(Packet.event(FILE_APPLIED)
-                .with("fileId", p.get("fileId"))
-                .with("version", incomingVersion)
-                .with("checksum", checksum));
-        notify("INFO", "Downloaded/synced " + rel + " (v" + incomingVersion + ")");
+            try {
+                // Suppress watcher events for both the staged file and its final path.
+                ignore.ignore(stagedPayload, 3000);
+                ignore.ignore(target, 3000);
+                try {
+                    Files.move(stagedPayload, target, StandardCopyOption.ATOMIC_MOVE,
+                            StandardCopyOption.REPLACE_EXISTING);
+                } catch (AtomicMoveNotSupportedException e) {
+                    Files.move(stagedPayload, target, StandardCopyOption.REPLACE_EXISTING);
+                }
+
+                String checksum = HashUtil.sha256(target);
+                if (Files.size(target) != expectedSize || !remoteChecksum.equalsIgnoreCase(checksum)) {
+                    throw new IOException("Written file failed size or SHA-256 verification");
+                }
+                state.put(ws, rel, incomingVersion, checksum);
+                network.send(Packet.event(FILE_APPLIED)
+                        .with("fileId", p.get("fileId"))
+                        .with("version", incomingVersion)
+                        .with("checksum", checksum));
+                suppressedWarnings.remove(ws + ":" + rel);
+                pendingDeferredSync.remove(ws + ":" + rel);
+                pendingLocalUploadRetry.remove(ws + ":" + rel);
+                notify("INFO", "Downloaded/synced " + rel + " (v" + incomingVersion + ")");
+            } catch (Exception ex) {
+                String key = ws + ":" + rel;
+                if (Files.isRegularFile(target)) {
+                    if (!dirty) {
+                        warnOnce(key, "New server version received for " + rel
+                                + ", but the file could not be safely replaced and verified: " + ex.getMessage());
+                        scheduleDeferredSync(key, rel);
+                        return;
+                    }
+                    warnOnce(key, "Conflict detected for " + rel
+                            + ". Local changes were preserved. The server version remains authoritative until resolved.");
+                    scheduleLocalUploadRetry(key, ws, rel);
+                    return;
+                }
+                warnOnce(key, "New server version received for " + rel
+                        + ", but the local file is not available right now. Sync will retry when the file is available again.");
+                scheduleDeferredSync(key, rel);
+            }
+        } finally {
+            Files.deleteIfExists(stagedPayload);
+        }
     }
 
     private void applyDelete(Packet p) throws Exception {

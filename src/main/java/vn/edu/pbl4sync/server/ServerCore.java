@@ -451,26 +451,41 @@ public class ServerCore implements AutoCloseable {
     private void rollbackFile(ClientSession s, Packet p) throws Exception {
         long fileId = p.getLong("fileId", 0);
         long sourceVersion = p.getLong("version", 0);
-        long baseVersion = requireNonNegativeLong(p, "baseVersion");
-        long totalSize = requireNonNegativeLong(p, "totalSize");
-        if (fileId <= 0 || sourceVersion <= 0) throw new IllegalArgumentException("Invalid file or source version");
-        Map<String, String> current = db.findFileById(fileId);
-        if (current == null) throw new IllegalArgumentException("File does not exist");
-        long ws = parseLong(current.get("workspace_id"), 0);
-        String path = sanitizeRelativePath(current.get("relative_path"));
-        if (!db.hasPermission(s.userId(), s.isAdmin(), ws, "READ")) throw new SecurityException("Read permission denied");
-        if (!db.hasPermission(s.userId(), s.isAdmin(), ws, "MODIFY")) throw new SecurityException("Modify permission denied");
-        if (baseVersion != parseLong(current.get("version"), -1)) {
-            s.send(p.response(OK).with("success", false).with("conflict", true)
-                    .with("currentVersion", current.getOrDefault("version", "0"))
-                    .with("currentChecksum", current.getOrDefault("checksum", "")));
-            return;
-        }
-
-        ChunkManifest manifest = chunkStore.loadManifest(fileId, sourceVersion, totalSize);
-        Path assembled = Files.createTempFile("pbl4sync-rollback-", ".tmp");
+        long baseVersion = -1;
+        Path assembled = null;
         boolean handedToBroadcast = false;
         try {
+            baseVersion = requireNonNegativeLong(p, "baseVersion");
+            long totalSize = requireNonNegativeLong(p, "totalSize");
+            if (fileId <= 0 || sourceVersion <= 0) {
+                throw new IllegalArgumentException("Invalid file or source version");
+            }
+            Map<String, String> current = db.findFileById(fileId);
+            if (current == null) throw new IllegalArgumentException("File does not exist");
+            long ws = parseLong(current.get("workspace_id"), 0);
+            String path = sanitizeRelativePath(current.get("relative_path"));
+            if (!db.hasPermission(s.userId(), s.isAdmin(), ws, "READ")) {
+                throw new SecurityException("Read permission denied");
+            }
+            if (!db.hasPermission(s.userId(), s.isAdmin(), ws, "MODIFY")) {
+                throw new SecurityException("Modify permission denied");
+            }
+            if (baseVersion != parseLong(current.get("version"), -1)) {
+                log("Rollback rejected: conflict user=" + s.username() + " file=" + fileId
+                        + " currentVersion=" + current.getOrDefault("version", "0")
+                        + " requestedBaseVersion=" + baseVersion + " sourceVersion=" + sourceVersion);
+                s.send(p.response(OK).with("success", false).with("conflict", true)
+                        .with("currentVersion", current.getOrDefault("version", "0"))
+                        .with("currentChecksum", current.getOrDefault("checksum", "")));
+                return;
+            }
+
+            ChunkManifest manifest = chunkStore.loadManifest(fileId, sourceVersion, totalSize);
+            String manifestText = manifest.serialize();
+            if (manifestText.getBytes(StandardCharsets.UTF_8).length > MAX_HEADER_SIZE - 1024) {
+                throw new IllegalArgumentException("Rollback manifest exceeds the 4 MiB protocol header limit");
+            }
+            assembled = Files.createTempFile("pbl4sync-rollback-", ".tmp");
             manifest.assembleTo(assembled, hash -> {
                 try {
                     return chunkStore.loadChunk(hash);
@@ -478,9 +493,13 @@ public class ServerCore implements AutoCloseable {
                     throw new IllegalStateException("Unable to load required chunk " + hash, e);
                 }
             });
-            Map<String, String> result = db.copyFileVersion(fileId, sourceVersion, baseVersion,
-                    s.userId(), s.deviceName());
+            String assembledChecksum = HashUtil.sha256(assembled);
+            Map<String, String> result = db.rollbackFileVersion(fileId, ws, sourceVersion, baseVersion,
+                    s.userId(), s.deviceName(), assembledChecksum);
             if (truthy(result.get("conflict"))) {
+                log("Rollback rejected: concurrent update user=" + s.username() + " file=" + fileId
+                        + " currentVersion=" + result.getOrDefault("current_version", "0")
+                        + " requestedBaseVersion=" + baseVersion + " sourceVersion=" + sourceVersion);
                 s.send(p.response(OK).with("success", false).with("conflict", true)
                         .with("currentVersion", result.getOrDefault("current_version", "0"))
                         .with("currentChecksum", result.getOrDefault("current_checksum", "")));
@@ -489,24 +508,53 @@ public class ServerCore implements AutoCloseable {
 
             long newVersion = Long.parseLong(result.get("version"));
             String checksum = result.getOrDefault("checksum", "");
+            long restoredSize = Long.parseLong(result.get("size"));
+            String restoredManifest = result.get("manifest");
             boolean deleted = truthy(result.get("deleted"));
-            db.logActivity(s.userId(), ws, "ROLLBACK", path + " v" + newVersion + " from v" + sourceVersion);
-            s.send(p.response(OK).with("success", true).with("fileId", fileId).with("version", newVersion)
-                    .with("rollbackFromVersion", sourceVersion).with("checksum", checksum)
-                    .with("size", result.getOrDefault("size", Long.toString(totalSize))));
+            log("Rollback committed user=" + s.username() + " file=" + fileId + " path=" + path
+                    + " fromVersion=" + baseVersion + " toVersion=" + sourceVersion
+                    + " newVersion=" + newVersion + " checksum=" + checksum + " size=" + restoredSize);
 
+            Packet response = p.response(OK).with("success", true).with("fileId", fileId)
+                    .with("version", newVersion).with("rollbackFromVersion", sourceVersion)
+                    .with("checksum", checksum).with("size", restoredSize);
             if (deleted) {
                 Packet del = Packet.event(FILE_DELETE).with("workspaceId", ws).with("path", path)
-                        .with("fileId", fileId).with("version", newVersion);
-                broadcastToWorkspace(ws, del, null, -1);
+                        .with("fileId", fileId).with("version", newVersion)
+                        .with("rollbackFromVersion", sourceVersion).with("operation", "ROLLBACK")
+                        .with("checksum", checksum).with("size", restoredSize).with("manifest", restoredManifest);
+                try {
+                    broadcastToWorkspace(ws, del, null, -1);
+                } catch (Exception e) {
+                    log("Rollback committed but delete broadcast scheduling failed file=" + fileId
+                            + " version=" + newVersion + ": " + e.getMessage());
+                }
             } else {
                 Packet deliver = Packet.event(FILE_DELIVER).with("workspaceId", ws).with("path", path).with("fileId", fileId)
-                        .with("version", newVersion).with("checksum", checksum).with("size", totalSize).with("conflict", false);
-                broadcastToWorkspace(ws, deliver, assembled, -1);
-                handedToBroadcast = true;
+                        .with("version", newVersion).with("checksum", checksum).with("size", restoredSize)
+                        .with("rollbackFromVersion", sourceVersion).with("operation", "ROLLBACK")
+                        .with("manifest", restoredManifest).with("conflict", false);
+                try {
+                    broadcastToWorkspace(ws, deliver, assembled, -1);
+                    handedToBroadcast = true;
+                } catch (Exception e) {
+                    log("Rollback committed but file broadcast scheduling failed file=" + fileId
+                            + " version=" + newVersion + ": " + e.getMessage());
+                }
             }
+            try {
+                s.send(response);
+            } catch (Exception e) {
+                log("Rollback committed but success response could not be sent file=" + fileId
+                        + " version=" + newVersion + ": " + e.getMessage());
+            }
+        } catch (Exception e) {
+            log("Rollback failed user=" + s.username() + " file=" + fileId
+                    + " sourceVersion=" + sourceVersion + " baseVersion=" + baseVersion
+                    + " reason=" + e.getMessage());
+            throw e;
         } finally {
-            if (!handedToBroadcast) Files.deleteIfExists(assembled);
+            if (!handedToBroadcast && assembled != null) Files.deleteIfExists(assembled);
         }
     }
 

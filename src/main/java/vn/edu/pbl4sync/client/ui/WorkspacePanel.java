@@ -238,6 +238,16 @@ public class WorkspacePanel extends JPanel {
             warn("The selected file has an invalid ID");
             return;
         }
+        long currentFileVersion;
+        try {
+            String value = f.get("version");
+            if (value == null || value.isBlank()) throw new NumberFormatException();
+            currentFileVersion = Long.parseLong(value);
+            if (currentFileVersion <= 0) throw new NumberFormatException();
+        } catch (NumberFormatException ex) {
+            warn("The selected file has an invalid current version");
+            return;
+        }
         UiAsync.run(() -> service.listFileVersions(fileId), versions -> {
             List<Map<String, String>> restorable = versions.stream()
                     .filter(v -> "true".equalsIgnoreCase(v.get("manifest_valid")))
@@ -263,14 +273,17 @@ public class WorkspacePanel extends JPanel {
                     != JOptionPane.YES_OPTION)
                 return;
             long size;
+            long sourceVersion;
             try {
                 size = Long.parseLong(version.get("size"));
+                sourceVersion = Long.parseLong(version.get("version"));
+                if (size < 0 || sourceVersion <= 0) throw new NumberFormatException();
             } catch (RuntimeException ex) {
-                warn("The selected version has an invalid size");
+                warn("The selected version has invalid metadata");
                 return;
             }
             UiAsync.run(() -> service.rollbackFile(w.id(), f.get("relative_path"), fileId,
-                    Long.parseLong(version.get("version")), size), response -> {
+                    currentFileVersion, sourceVersion, size), response -> {
                 if (!response.getBoolean("success", false)) {
                     warn(response.getBoolean("conflict", false)
                             ? "Rollback was not applied because the file changed. Refresh and try again."
