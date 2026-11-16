@@ -14,6 +14,8 @@ public final class MessageTypes {
     public static final String LIST_WORKSPACES_RESPONSE = "LIST_WORKSPACES_RESPONSE";
     public static final String LIST_FILES_REQUEST = "LIST_FILES_REQUEST";
     public static final String LIST_FILES_RESPONSE = "LIST_FILES_RESPONSE";
+    public static final String FILE_VERSIONS_REQUEST = "FILE_VERSIONS_REQUEST";
+    public static final String FILE_VERSIONS_RESPONSE = "FILE_VERSIONS_RESPONSE";
     public static final String LIST_MEMBERS_REQUEST = "LIST_MEMBERS_REQUEST";
     public static final String LIST_MEMBERS_RESPONSE = "LIST_MEMBERS_RESPONSE";
     public static final String LIST_USERS_REQUEST = "LIST_USERS_REQUEST";

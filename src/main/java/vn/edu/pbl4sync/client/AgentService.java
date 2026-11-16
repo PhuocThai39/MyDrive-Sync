@@ -116,6 +116,10 @@ public class AgentService implements AutoCloseable {
                 .decode(request(Packet.request(LIST_FILES_REQUEST).with("workspaceId", workspaceId)).get("rows"));
     }
 
+    public List<Map<String, String>> listFileVersions(long fileId) throws Exception {
+        return TableCodec.decode(request(Packet.request(FILE_VERSIONS_REQUEST).with("fileId", fileId)).get("rows"));
+    }
+
     public List<Map<String, String>> listMembers(long workspaceId) throws Exception {
         return TableCodec
                 .decode(request(Packet.request(LIST_MEMBERS_REQUEST).with("workspaceId", workspaceId)).get("rows"));

@@ -392,6 +392,25 @@ public class Database implements AutoCloseable {
             """, workspaceId);
     }
 
+    public List<Map<String, String>> listFileVersions(long fileId) throws SQLException {
+        List<Map<String, String>> versions = query("""
+            SELECT version,checksum,manifest,is_deleted,operation,rollback_from_version,created_at
+            FROM file_versions WHERE file_id=? ORDER BY version DESC
+            """, fileId);
+        for (Map<String, String> version : versions) {
+            try {
+                ChunkManifest manifest = ChunkManifest.parse(version.getOrDefault("manifest", ""));
+                version.put("size", Long.toString(manifest.totalSize()));
+                version.put("manifest_valid", "true");
+            } catch (IllegalArgumentException e) {
+                version.put("size", "");
+                version.put("manifest_valid", "false");
+            }
+            version.remove("manifest");
+        }
+        return versions;
+    }
+
     public Map<String, String> findFile(long workspaceId, String relativePath) throws SQLException {
         return queryOne("SELECT id,workspace_id,relative_path,size,checksum,version,deleted,modified_by,modified_at FROM files WHERE workspace_id=? AND relative_path=?",
                 workspaceId, relativePath);

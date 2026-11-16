@@ -25,6 +25,7 @@ public class WorkspacePanel extends JPanel {
     private final JButton addMember = new JButton("Add Member");
     private final JButton editPermission = new JButton("Edit Permission");
     private final JButton removeMember = new JButton("Remove Member");
+    private final JButton rollback = new JButton("Rollback");
     private final JButton createWorkspace = new JButton("Create Workspace");
     private final JButton changeLeader = new JButton("Change Leader");
     private final JButton deleteWorkspace = new JButton("Delete Workspace");
@@ -76,6 +77,7 @@ public class WorkspacePanel extends JPanel {
         JButton upload = new JButton("Upload");
         JButton copy = new JButton("Save a Copy");
         JButton delete = new JButton("Delete");
+        rollback.addActionListener(e -> rollbackSelected());
         JButton open = new JButton("Open Local Folder");
         JButton sync = new JButton("Sync Now");
         upload.addActionListener(e -> upload());
@@ -89,6 +91,7 @@ public class WorkspacePanel extends JPanel {
         b.add(upload);
         b.add(copy);
         b.add(delete);
+        b.add(rollback);
         b.add(open);
         b.add(sync);
         p.add(b, BorderLayout.SOUTH);
@@ -217,6 +220,65 @@ public class WorkspacePanel extends JPanel {
                 service.deleteWorkspaceFile(w.id(), f.get("relative_path"));
                 return null;
             }, x -> loadSelected(), ex -> UiAsync.error(this, ex));
+    }
+
+    private void rollbackSelected() {
+        WorkspaceItem w = selected();
+        Map<String, String> f = selectedFile();
+        if (w == null || f == null)
+            return;
+        if (!service.allowed(w.row(), "MODIFY") || !service.allowed(w.row(), "READ")) {
+            warn("Rollback requires Read and Modify permission");
+            return;
+        }
+        long fileId;
+        try {
+            fileId = Long.parseLong(f.getOrDefault("id", "0"));
+        } catch (NumberFormatException ex) {
+            warn("The selected file has an invalid ID");
+            return;
+        }
+        UiAsync.run(() -> service.listFileVersions(fileId), versions -> {
+            List<Map<String, String>> restorable = versions.stream()
+                    .filter(v -> "true".equalsIgnoreCase(v.get("manifest_valid")))
+                    .filter(v -> !v.getOrDefault("version", "").equals(f.get("version")))
+                    .toList();
+            if (restorable.isEmpty()) {
+                warn("No valid older version is available to restore");
+                return;
+            }
+            VersionItem[] options = restorable.stream().map(VersionItem::new).toArray(VersionItem[]::new);
+            VersionItem chosen = (VersionItem) JOptionPane.showInputDialog(this,
+                    "Choose the version to restore for " + f.get("relative_path") + ":",
+                    "Rollback", JOptionPane.QUESTION_MESSAGE, null, options, options[0]);
+            if (chosen == null)
+                return;
+            Map<String, String> version = chosen.row();
+            String effect = truthy(version.get("is_deleted"))
+                    ? "This version represents a deleted file; rollback will delete the file again."
+                    : "The selected snapshot will become a new current version.";
+            if (JOptionPane.showConfirmDialog(this,
+                    "Restore version " + version.get("version") + "?\n" + effect,
+                    "Confirm Rollback", JOptionPane.YES_NO_OPTION, JOptionPane.WARNING_MESSAGE)
+                    != JOptionPane.YES_OPTION)
+                return;
+            long size;
+            try {
+                size = Long.parseLong(version.get("size"));
+            } catch (RuntimeException ex) {
+                warn("The selected version has an invalid size");
+                return;
+            }
+            UiAsync.run(() -> service.rollbackFile(w.id(), f.get("relative_path"), fileId,
+                    Long.parseLong(version.get("version")), size), response -> {
+                if (!response.getBoolean("success", false)) {
+                    warn(response.getBoolean("conflict", false)
+                            ? "Rollback was not applied because the file changed. Refresh and try again."
+                            : "Rollback was not applied.");
+                }
+                loadSelected();
+            }, ex -> UiAsync.error(this, ex));
+        }, ex -> UiAsync.error(this, ex));
     }
 
     private void openFolder() {
@@ -362,6 +424,22 @@ public class WorkspacePanel extends JPanel {
         @Override
         public String toString() {
             return row.get("name") + "  [" + row.getOrDefault("workspace_role", "") + "]";
+        }
+    }
+
+    private record VersionItem(Map<String, String> row) {
+        @Override
+        public String toString() {
+            String deleted = truthyStatic(row.get("is_deleted")) ? " · deleted" : "";
+            String rollback = "ROLLBACK".equalsIgnoreCase(row.get("operation"))
+                    ? " · rollback from v" + row.getOrDefault("rollback_from_version", "?") : "";
+            return "v" + row.getOrDefault("version", "?") + " · "
+                    + row.getOrDefault("created_at", "") + " · "
+                    + row.getOrDefault("operation", "") + rollback + deleted;
+        }
+
+        private static boolean truthyStatic(String s) {
+            return "1".equals(s) || "true".equalsIgnoreCase(s);
         }
     }
 

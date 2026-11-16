@@ -77,6 +77,7 @@ public class ServerCore implements AutoCloseable {
             case DASHBOARD_REQUEST -> dashboard(session, p);
             case LIST_WORKSPACES_REQUEST -> listWorkspaces(session, p);
             case LIST_FILES_REQUEST -> listFiles(session, p);
+            case FILE_VERSIONS_REQUEST -> listFileVersions(session, p);
             case LIST_MEMBERS_REQUEST -> listMembers(session, p);
             case LIST_USERS_REQUEST -> listUsers(session, p);
             case LIST_AGENTS_REQUEST -> listAgents(session, p);
@@ -136,6 +137,17 @@ public class ServerCore implements AutoCloseable {
         long ws = p.getLong("workspaceId", 0);
         requireRead(s, ws);
         s.send(p.response(LIST_FILES_RESPONSE).with("rows", TableCodec.encode(db.listFiles(ws))));
+    }
+
+    private void listFileVersions(ClientSession s, Packet p) throws Exception {
+        long fileId = p.getLong("fileId", 0);
+        if (fileId <= 0) throw new IllegalArgumentException("Invalid file ID");
+        Map<String, String> file = db.findFileById(fileId);
+        if (file == null) throw new IllegalArgumentException("File does not exist");
+        long workspaceId = parseLong(file.get("workspace_id"), 0);
+        requireRead(s, workspaceId);
+        s.send(p.response(FILE_VERSIONS_RESPONSE)
+                .with("rows", TableCodec.encode(db.listFileVersions(fileId))));
     }
 
     private void listMembers(ClientSession s, Packet p) throws Exception {
