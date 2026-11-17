@@ -15,6 +15,7 @@ CompanySync/
 *.bak
 *.swp
 *.swo
+BackUp/
 
 # Operating system files
 .DS_Store
