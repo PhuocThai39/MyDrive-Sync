@@ -16,7 +16,7 @@ CompanySync/
 *.swp
 *.swo
 BackUp/
-
+certs/
 # Operating system files
 .DS_Store
 Thumbs.db
