@@ -6,6 +6,7 @@ import vn.edu.pbl4sync.common.ProtocolIO;
 import vn.edu.pbl4sync.common.ReceivedPacket;
 
 import java.net.Socket;
+import javax.net.ssl.SSLSocket;
 
 public class ClientHandler implements Runnable {
     private final ServerCore server;
@@ -20,6 +21,12 @@ public class ClientHandler implements Runnable {
     public void run() {
         ClientSession session = new ClientSession(socket);
         try {
+            if (!(socket instanceof SSLSocket tlsSocket)) {
+                throw new IllegalStateException("TLS is required for client connections");
+            }
+            tlsSocket.setSoTimeout(10_000);
+            tlsSocket.startHandshake();
+            tlsSocket.setSoTimeout(0);
             while (!socket.isClosed()) {
                 try (ReceivedPacket received = ProtocolIO.receive(socket.getInputStream())) {
                     if (received == null) break;

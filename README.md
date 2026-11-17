@@ -83,8 +83,9 @@ config/server.properties
 
 Cấu hình ví dụ:
 
-db.url=jdbc:mysql://localhost:3306/pbl4sync?createDatabaseIfNotExist=true&useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Ho_Chi_Minh
+db.url=jdbc:mysql://localhost:3306/pbl4sync?createDatabaseIfNotExist=true&allowPublicKeyRetrieval=true&serverTimezone=Asia/Ho_Chi_Minh
 db.user=root
+db.sslMode=DISABLED
 db.password=MAT_KHAU_MYSQL_CUA_MAY_SERVER
 
 Ví dụ MySQL root password là 123456:
@@ -95,6 +96,32 @@ db.password=123456
 Lưu ý: db.password là mật khẩu MySQL, không phải mật khẩu tài khoản Admin của ứng dụng.
 
 Project sẽ tự tạo database pbl4sync và các bảng cần thiết khi Server chạy lần đầu.
+
+`db.sslMode=DISABLED` giữ tương thích cho MySQL chạy local trên cùng máy. Nếu
+MySQL ở máy khác, hãy cấu hình TLS trên MySQL Server và dùng
+`db.sslMode=VERIFY_IDENTITY` để mã hóa kết nối đồng thời kiểm tra CA và hostname
+của máy DB. Địa chỉ host trong `db.url` phải khớp DNS/IP trong SAN của
+certificate MySQL. Không dùng `REQUIRED` thay cho `VERIFY_IDENTITY` khi cần
+chống giả mạo server.
+
+Với `VERIFY_IDENTITY`, lấy CA certificate đáng tin cậy của MySQL Server và
+chuyển tới máy chạy ứng dụng qua kênh an toàn. Tạo truststore PKCS#12:
+
+```powershell
+New-Item -ItemType Directory -Force certs
+$env:PBL4SYNC_DB_TRUSTSTORE_PASSWORD = Read-Host "MySQL truststore password"
+keytool -importcert -noprompt -alias mysql-ca -file C:\path\to\mysql-ca.pem `
+  -storetype PKCS12 -keystore certs\mysql-truststore.p12 `
+  -storepass:env PBL4SYNC_DB_TRUSTSTORE_PASSWORD
+```
+
+Thiết lập `PBL4SYNC_DB_TRUSTSTORE_PASSWORD` trong môi trường khởi chạy Server.
+Truststore mặc định là `certs/mysql-truststore.p12`; có thể đổi vị trí bằng
+`PBL4SYNC_DB_TRUSTSTORE`. Mật khẩu không được ghi trong `server.properties`.
+Nếu MySQL dùng chứng chỉ tự ký, certificate đó có thể làm CA tin cậy trong
+truststore, nhưng vẫn phải xác minh fingerprint độc lập. MySQL Server cũng
+phải được cấu hình bật TLS; ứng dụng sẽ báo lỗi nếu chế độ xác minh yêu cầu
+truststore mà truststore/mật khẩu chưa được cấu hình.
 
 6. Chạy Server
 
@@ -117,7 +144,65 @@ Nếu Server và Agent chạy trên cùng máy, Agent kết nối:
 IP: 127.0.0.1
 Port: 5000
 
-7. Chạy Agent
+7. Bật TLS cho kết nối Agent-Server
+
+Server và Agent bắt buộc dùng TLS 1.2 trở lên. Cần tạo một PKCS#12 chứa
+private key/certificate cho Server và một truststore chứa certificate công khai
+đó cho các Agent. Client xác minh certificate và tên máy trong SAN; không có
+fallback về TCP không mã hóa.
+
+Trên máy Server, mở PowerShell tại thư mục project và đặt mật khẩu store vào
+environment (không ghi mật khẩu vào file được Git theo dõi):
+
+```powershell
+$env:PBL4SYNC_TLS_KEYSTORE_PASSWORD = Read-Host "TLS keystore password"
+$env:PBL4SYNC_TLS_KEY_PASSWORD = $env:PBL4SYNC_TLS_KEYSTORE_PASSWORD
+New-Item -ItemType Directory -Force certs
+keytool -genkeypair -alias pbl4sync-server -keyalg RSA -keysize 3072 `
+  -storetype PKCS12 -keystore certs\server.p12 -validity 365 `
+  -dname "CN=localhost" `
+  -ext "SAN=dns:localhost,ip:127.0.0.1,ip:192.168.1.10" `
+  -storepass:env PBL4SYNC_TLS_KEYSTORE_PASSWORD `
+  -keypass:env PBL4SYNC_TLS_KEY_PASSWORD
+keytool -exportcert -rfc -alias pbl4sync-server -keystore certs\server.p12 `
+  -storetype PKCS12 -file certs\server.crt `
+  -storepass:env PBL4SYNC_TLS_KEYSTORE_PASSWORD
+```
+
+Thay `192.168.1.10` bằng địa chỉ IP hoặc DNS mà Agent sẽ dùng để kết nối.
+Thêm tất cả tên/IP cần thiết vào SAN trước khi cấp certificate. Nếu certificate
+đã tạo không có SAN phù hợp, hãy tạo lại certificate.
+
+Trên mỗi máy Agent, chuyển `server.crt` qua kênh đáng tin cậy, xác minh
+fingerprint của certificate với quản trị viên qua một kênh độc lập, rồi nhập
+certificate vào truststore:
+
+```powershell
+$env:PBL4SYNC_TLS_TRUSTSTORE_PASSWORD = Read-Host "TLS truststore password"
+New-Item -ItemType Directory -Force certs
+keytool -importcert -noprompt -alias pbl4sync-server -file certs\server.crt `
+  -storetype PKCS12 -keystore certs\server-truststore.p12 `
+  -storepass:env PBL4SYNC_TLS_TRUSTSTORE_PASSWORD
+```
+
+Giữ `server.p12` và mật khẩu keystore chỉ trên máy Server. Chỉ phân phối
+certificate công khai/truststore cho Agent. Thư mục `certs` bị loại khỏi Git.
+Các biến environment cần được đặt trong môi trường đã khởi chạy ứng dụng:
+
+- Server: `PBL4SYNC_TLS_KEYSTORE` (mặc định `certs/server.p12`),
+  `PBL4SYNC_TLS_KEYSTORE_PASSWORD`; `PBL4SYNC_TLS_KEY_PASSWORD` mặc định dùng
+  cùng mật khẩu keystore.
+- Agent: `PBL4SYNC_TLS_TRUSTSTORE` (mặc định `certs/server-truststore.p12`),
+  `PBL4SYNC_TLS_TRUSTSTORE_PASSWORD`.
+
+Nếu chạy từ VS Code, hãy khởi chạy VS Code từ PowerShell đã đặt biến hoặc cấu
+hình các biến trong môi trường người dùng rồi khởi động lại VS Code. Mọi Agent
+phải kết nối bằng đúng DNS/IP có trong SAN của certificate. Thiếu store, sai
+mật khẩu hoặc certificate/hostname không khớp sẽ làm kết nối thất bại.
+TLS Agent-Server và TLS JDBC là hai kênh riêng, cần cấu hình certificate và
+truststore riêng cho từng dịch vụ.
+
+8. Chạy Agent
 
 Trong VS Code:
 
@@ -138,7 +223,7 @@ Có thể thay đổi password mặc định trong:
 
 config/server.properties
 
-8. Kết nối nhiều máy trong cùng LAN
+9. Kết nối nhiều máy trong cùng LAN
 
 Giả sử máy chạy Server có IPv4:
 
@@ -171,7 +256,7 @@ Windows Firewall có chặn Java hoặc TCP port 5000 không.
 
 IP Server có đúng không.
 
-9. Vai trò của từng chương trình
+10. Vai trò của từng chương trình
 
 Agent A ---------\
 Agent B ----------> Java Server ----> MySQL
@@ -241,7 +326,7 @@ Activity Log
 
 File thật được lưu tại các Agent; Server chủ yếu quản lý metadata và điều phối đồng bộ.
 
-10. Workflow Git đề xuất cho nhóm
+11. Workflow Git đề xuất cho nhóm
 
 Không nên code trực tiếp toàn bộ trên main.
 
@@ -264,7 +349,7 @@ git push origin thai
 
 Sau đó tạo Pull Request trên GitHub để merge vào main.
 
-11. Trước khi push code
+12. Trước khi push code
 
 Luôn chạy:
 
@@ -281,7 +366,7 @@ db.password=YOUR_MYSQL_PASSWORD
 
 Mỗi thành viên tự sửa password trên máy mình.
 
-12. Cách cập nhật khi thành viên khác đã merge code mới
+13. Cách cập nhật khi thành viên khác đã merge code mới
 
 git checkout main
 git pull origin main
@@ -296,7 +381,7 @@ Nếu có conflict thì xử lý conflict rồi:
 git add .
 git commit -m "Resolve merge conflict"
 
-13. Kịch bản test nhóm
+14. Kịch bản test nhóm
 
 Có thể dùng 3 máy:
 
@@ -326,7 +411,7 @@ Tạo hoặc sửa file trong Shared Folder.
 
 Kiểm tra file được tự động đồng bộ sang Agent khác.
 
-14. Lỗi thường gặp
+15. Lỗi thường gặp
 
 MySQL báo Access denied for user 'root'@'localhost'
 

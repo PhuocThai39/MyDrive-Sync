@@ -1,24 +1,91 @@
 package vn.edu.pbl4sync.server;
 
-import vn.edu.pbl4sync.common.*;
-import vn.edu.pbl4sync.server.db.ChunkStore;
-import vn.edu.pbl4sync.server.db.Database;
-
 import java.io.IOException;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.charset.StandardCharsets;
 import java.sql.SQLException;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
-import java.util.*;
-import java.util.concurrent.*;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.regex.Pattern;
 
-import static vn.edu.pbl4sync.common.MessageTypes.*;
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLServerSocket;
+import javax.net.ssl.SSLSocket;
+
+import vn.edu.pbl4sync.common.ChunkManifest;
+import vn.edu.pbl4sync.common.HashUtil;
+import static vn.edu.pbl4sync.common.MessageTypes.ADD_MEMBER_REQUEST;
+import static vn.edu.pbl4sync.common.MessageTypes.CHANGE_LEADER_REQUEST;
+import static vn.edu.pbl4sync.common.MessageTypes.CHUNK_QUERY;
+import static vn.edu.pbl4sync.common.MessageTypes.CHUNK_QUERY_RESULT;
+import static vn.edu.pbl4sync.common.MessageTypes.CHUNK_UPLOAD;
+import static vn.edu.pbl4sync.common.MessageTypes.CONFLICT_NOTICE;
+import static vn.edu.pbl4sync.common.MessageTypes.CREATE_USER_REQUEST;
+import static vn.edu.pbl4sync.common.MessageTypes.CREATE_WORKSPACE_REQUEST;
+import static vn.edu.pbl4sync.common.MessageTypes.DASHBOARD_REQUEST;
+import static vn.edu.pbl4sync.common.MessageTypes.DASHBOARD_RESPONSE;
+import static vn.edu.pbl4sync.common.MessageTypes.DELETE_WORKSPACE_REQUEST;
+import static vn.edu.pbl4sync.common.MessageTypes.ERROR;
+import static vn.edu.pbl4sync.common.MessageTypes.FILE_APPLIED;
+import static vn.edu.pbl4sync.common.MessageTypes.FILE_DELETE;
+import static vn.edu.pbl4sync.common.MessageTypes.FILE_DELIVER;
+import static vn.edu.pbl4sync.common.MessageTypes.FILE_EVENT;
+import static vn.edu.pbl4sync.common.MessageTypes.FILE_EVENT_RESULT;
+import static vn.edu.pbl4sync.common.MessageTypes.FILE_FETCH_REQUEST;
+import static vn.edu.pbl4sync.common.MessageTypes.FILE_RELAY_UPLOAD;
+import static vn.edu.pbl4sync.common.MessageTypes.FILE_ROLLBACK_REQUEST;
+import static vn.edu.pbl4sync.common.MessageTypes.FILE_UPLOAD_REQUEST;
+import static vn.edu.pbl4sync.common.MessageTypes.FILE_VERSIONS_REQUEST;
+import static vn.edu.pbl4sync.common.MessageTypes.FILE_VERSIONS_RESPONSE;
+import static vn.edu.pbl4sync.common.MessageTypes.LIST_ACTIVITY_REQUEST;
+import static vn.edu.pbl4sync.common.MessageTypes.LIST_ACTIVITY_RESPONSE;
+import static vn.edu.pbl4sync.common.MessageTypes.LIST_AGENTS_REQUEST;
+import static vn.edu.pbl4sync.common.MessageTypes.LIST_AGENTS_RESPONSE;
+import static vn.edu.pbl4sync.common.MessageTypes.LIST_FILES_REQUEST;
+import static vn.edu.pbl4sync.common.MessageTypes.LIST_FILES_RESPONSE;
+import static vn.edu.pbl4sync.common.MessageTypes.LIST_MEMBERS_REQUEST;
+import static vn.edu.pbl4sync.common.MessageTypes.LIST_MEMBERS_RESPONSE;
+import static vn.edu.pbl4sync.common.MessageTypes.LIST_USERS_REQUEST;
+import static vn.edu.pbl4sync.common.MessageTypes.LIST_USERS_RESPONSE;
+import static vn.edu.pbl4sync.common.MessageTypes.LIST_WORKSPACES_REQUEST;
+import static vn.edu.pbl4sync.common.MessageTypes.LIST_WORKSPACES_RESPONSE;
+import static vn.edu.pbl4sync.common.MessageTypes.LOGIN_REQUEST;
+import static vn.edu.pbl4sync.common.MessageTypes.LOGIN_RESPONSE;
+import static vn.edu.pbl4sync.common.MessageTypes.NOTIFICATION;
+import static vn.edu.pbl4sync.common.MessageTypes.OK;
+import static vn.edu.pbl4sync.common.MessageTypes.REMOVE_MEMBER_REQUEST;
+import static vn.edu.pbl4sync.common.MessageTypes.SET_USER_STATUS_REQUEST;
+import static vn.edu.pbl4sync.common.MessageTypes.SYNC_REPORT;
+import static vn.edu.pbl4sync.common.MessageTypes.SYNC_REPORT_RESULT;
+import static vn.edu.pbl4sync.common.MessageTypes.SYNC_STATE;
+import static vn.edu.pbl4sync.common.MessageTypes.UPDATE_PERMISSION_REQUEST;
+import static vn.edu.pbl4sync.common.MessageTypes.WORKSPACES_CHANGED;
+import vn.edu.pbl4sync.common.Packet;
+import vn.edu.pbl4sync.common.RabinChunker;
+import vn.edu.pbl4sync.common.ReceivedPacket;
+import vn.edu.pbl4sync.common.TableCodec;
+import vn.edu.pbl4sync.common.TlsSupport;
+import vn.edu.pbl4sync.server.db.ChunkStore;
+import vn.edu.pbl4sync.server.db.Database;
 
 public class ServerCore implements AutoCloseable {
     private static final long CHUNK_UPLOAD_TTL_MILLIS = TimeUnit.MINUTES.toMillis(10);
@@ -30,6 +97,7 @@ public class ServerCore implements AutoCloseable {
     private final Map<String, RelayTicket> relayTickets = new ConcurrentHashMap<>();
     private ExecutorService clientPool;
     private ExecutorService transferPool;
+    private SSLContext tlsContext;
     private volatile boolean running;
     private ServerSocket serverSocket;
     private Database db;
@@ -40,11 +108,14 @@ public class ServerCore implements AutoCloseable {
 
     public synchronized void start() throws Exception {
         if (running) return;
-        db = new Database(config.dbUrl(), config.dbUser(), config.dbPassword(), config.dbPoolSize(), config.initialAdminPassword());
+        db = new Database(config.dbUrl(), config.dbUser(), config.dbPassword(), config.dbPoolSize(), config.dbConnectionProperties(), config.initialAdminPassword());
         chunkStore = new ChunkStore(db);
         clientPool = Executors.newFixedThreadPool(config.clientThreads());
         transferPool = Executors.newFixedThreadPool(config.transferThreads());
-        serverSocket = new ServerSocket(config.port());
+        SSLServerSocket tlsServerSocket = (SSLServerSocket)tlsContext.getServerSocketFactory()
+                .createServerSocket(config.port());
+        TlsSupport.configureServerSocket(tlsServerSocket);
+        serverSocket = tlsServerSocket;
         running = true;
         log("Server started on port " + config.port());
         Thread acceptThread = new Thread(this::acceptLoop, "server-accept");
@@ -55,7 +126,12 @@ public class ServerCore implements AutoCloseable {
     private void acceptLoop() {
         while (running) {
             try {
-                Socket socket = serverSocket.accept();
+                Socket accepted = serverSocket.accept();
+                if (!(accepted instanceof SSLSocket socket)) {
+                    accepted.close();
+                    throw new IOException("Non-TLS client connection rejected");
+                }
+                TlsSupport.configureServerSocket(socket);
                 socket.setKeepAlive(true);
                 socket.setTcpNoDelay(true);
                 clientPool.submit(new ClientHandler(this, socket));

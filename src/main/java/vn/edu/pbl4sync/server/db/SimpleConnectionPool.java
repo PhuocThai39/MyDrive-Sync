@@ -3,6 +3,7 @@ package vn.edu.pbl4sync.server.db;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.SQLException;
+import java.util.Properties;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.TimeUnit;
@@ -10,10 +11,20 @@ import java.util.concurrent.TimeUnit;
 public class SimpleConnectionPool implements AutoCloseable {
     private final BlockingQueue<Connection> pool;
 
-    public SimpleConnectionPool(String url, String user, String password, int size) throws SQLException {
+    public SimpleConnectionPool(String url, String user, String password, int size, Properties connectionProperties)
+            throws SQLException {
         this.pool = new ArrayBlockingQueue<>(size);
-        for (int i = 0; i < size; i++) {
-            pool.add(DriverManager.getConnection(url, user, password));
+        try {
+            for (int i = 0; i < size; i++) {
+                Properties properties = new Properties();
+                properties.putAll(connectionProperties);
+                properties.setProperty("user", user);
+                properties.setProperty("password", password);
+                pool.add(DriverManager.getConnection(url, properties));
+            }
+        } catch (SQLException e) {
+            close();
+            throw e;
         }
     }
 

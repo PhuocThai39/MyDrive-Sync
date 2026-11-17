@@ -8,6 +8,7 @@ import java.time.Duration;
 import java.util.Map;
 import java.util.concurrent.*;
 import java.util.function.Consumer;
+import javax.net.ssl.SSLSocket;
 
 public class NetworkClient implements AutoCloseable {
     private Socket socket;
@@ -18,9 +19,20 @@ public class NetworkClient implements AutoCloseable {
     private volatile boolean running;
 
     public void connect(String host, int port) throws Exception {
-        socket = new Socket(host, port);
-        socket.setKeepAlive(true);
-        socket.setTcpNoDelay(true);
+        SSLSocket tlsSocket = (SSLSocket) TlsSupport.clientContext()
+                .getSocketFactory().createSocket(host, port);
+        try {
+            TlsSupport.configureClientSocket(tlsSocket);
+            tlsSocket.setSoTimeout(10_000);
+            tlsSocket.startHandshake();
+            tlsSocket.setSoTimeout(0);
+            tlsSocket.setKeepAlive(true);
+            tlsSocket.setTcpNoDelay(true);
+        } catch (Exception e) {
+            try { tlsSocket.close(); } catch (Exception closeError) { e.addSuppressed(closeError); }
+            throw e;
+        }
+        socket = tlsSocket;
         running = true;
         Thread reader = new Thread(this::readLoop, "agent-network-reader");
         reader.setDaemon(true);
