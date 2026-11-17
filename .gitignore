@@ -8,7 +8,7 @@
 CompanySync/
 .pbl4sync/
 .pbl4sync-state.properties
-/config/*.properties
+/config/
 # Local logs and temporary files
 *.log
 *.tmp
