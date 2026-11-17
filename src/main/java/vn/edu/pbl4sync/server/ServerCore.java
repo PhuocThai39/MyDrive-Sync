@@ -108,6 +108,7 @@ public class ServerCore implements AutoCloseable {
 
     public synchronized void start() throws Exception {
         if (running) return;
+        this.tlsContext = TlsSupport.serverContext();
         db = new Database(config.dbUrl(), config.dbUser(), config.dbPassword(), config.dbPoolSize(), config.dbConnectionProperties(), config.initialAdminPassword());
         chunkStore = new ChunkStore(db);
         clientPool = Executors.newFixedThreadPool(config.clientThreads());
