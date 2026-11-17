@@ -24,7 +24,7 @@ import java.util.function.LongFunction;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
-/** Local manifest archive with one verified full copy for the latest archived version. */
+/** Local archive of file-version manifests. */
 public final class LocalBackupStore {
     private static final DateTimeFormatter TIMESTAMP = DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss")
             .withZone(ZoneOffset.UTC);
@@ -58,7 +58,7 @@ public final class LocalBackupStore {
         }
     }
 
-    /** Archives the current file as one immutable version and refreshes the latest full copy when appropriate. */
+    /** Archives the current file version as a manifest. */
     public synchronized BackupVersion archiveVersion(long workspaceId, String relativePath,
                                                       long version, Path sourceFile) throws IOException {
         if (workspaceId <= 0 || version < 0) throw new IllegalArgumentException("Invalid workspace or version");
@@ -72,7 +72,6 @@ public final class LocalBackupStore {
 
         Path snapshot = Files.createTempFile(directory, ".backup-capture-", ".tmp");
         Path stagedManifest = null;
-        boolean snapshotMoved = false;
         boolean manifestMoved = false;
         try {
             BasicFileAttributes before = Files.readAttributes(source, BasicFileAttributes.class);
@@ -95,27 +94,20 @@ public final class LocalBackupStore {
                 }
             }
 
-            long latestVersion = existing.stream().mapToLong(BackupVersion::version).max().orElse(-1);
-            boolean shouldKeepFullCopy = version >= latestVersion;
             String timestamp = TIMESTAMP.format(Instant.now());
             String stem = displayName + "_v" + version + "_" + timestamp;
             Path manifestPath = directory.resolve(stem + ".manifest");
-            Path fullCopyPath = shouldKeepFullCopy ? directory.resolve(stem + ".full") : null;
+            Path fullCopyPath = null;
             stagedManifest = Files.createTempFile(directory, ".backup-manifest-", ".tmp");
             manifest.writeTo(stagedManifest);
 
             moveReplacing(stagedManifest, manifestPath);
             manifestMoved = true;
-            if (shouldKeepFullCopy) {
-                moveReplacing(snapshot, fullCopyPath);
-                snapshotMoved = true;
-                removeOlderFullCopies(directory, displayName, fullCopyPath);
-            }
 
             return new BackupVersion(workspaceId, normalizedRelativePath, version,
                     timestamp, manifestPath, fullCopyPath);
         } finally {
-            if (!snapshotMoved) Files.deleteIfExists(snapshot);
+            Files.deleteIfExists(snapshot);
             if (stagedManifest != null && !manifestMoved) Files.deleteIfExists(stagedManifest);
         }
     }
@@ -136,10 +128,6 @@ public final class LocalBackupStore {
         ChunkManifest archived = readManifestFile(existing.get().manifestPath());
         if (!current.serialize().equals(archived.serialize())) {
             throw new IOException("Version " + version + " already exists with different content");
-        }
-        if (existing.get().fullCopyPath() == null
-                && versions.stream().mapToLong(BackupVersion::version).max().orElse(-1) == version) {
-            return archiveVersion(workspaceId, normalizedRelativePath, version, sourceFile);
         }
         if (existing.get().fullCopyPath() != null) {
             try {
@@ -195,7 +183,7 @@ public final class LocalBackupStore {
         throw new IOException("Backup manifest not found for version " + version);
     }
 
-    /** Restores the newest available, manifest-verified full copy while offline. */
+    /** Restores the newest available, manifest-verified full copy while offline, if one exists. */
     public synchronized BackupVersion restoreLatestOffline(long workspaceId, String relativePath,
                                                            Path destination) throws IOException {
         String normalizedRelativePath = normalizeRelativePath(relativePath);
